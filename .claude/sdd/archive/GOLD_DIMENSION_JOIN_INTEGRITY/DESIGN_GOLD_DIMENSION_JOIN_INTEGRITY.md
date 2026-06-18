@@ -14,7 +14,7 @@
 | **Date** | 2026-06-18 |
 | **Author** | design-agent |
 | **DEFINE** | Nenhum — ver Scope Note abaixo |
-| **Status** | Draft / Ready for Build |
+| **Status** | ✅ Shipped (2026-06-18) |
 
 ---
 
@@ -496,6 +496,7 @@ YAML já existente (`quality.rules`), sem novos widgets ou variáveis do DABs.
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0 | 2026-06-18 | design-agent | Versão inicial, decidindo entre Abordagem A e B da auditoria Gold — resultado: híbrido (Decisions 1–3) |
+| 1.1 | 2026-06-18 | ship-agent | Shipped and archived |
 
 ---
 
