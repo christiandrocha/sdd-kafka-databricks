@@ -5,6 +5,23 @@
 ![Delta Lake](https://img.shields.io/badge/Delta%20Lake-3.1-orange)
 ![Databricks](https://img.shields.io/badge/Databricks-DBR%2014.1-red)
 ![Kafka](https://img.shields.io/badge/Kafka-3.7%20KRaft-black)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+---
+
+## TL;DR
+
+A food-delivery company's data is scattered across four different systems —
+a live order stream, a customer database, a restaurant catalog, a driver
+registry — each speaking its own language and updating on its own schedule.
+This project builds the pipeline that listens to every change the moment it
+happens and lands it, cleaned and trustworthy, in one place business teams
+can query with confidence.
+
+It's a working, end-to-end simulation of that pipeline for the Uber Eats
+Brazilian market: **20 data domains, 4 source systems, 129k records**,
+streamed in real time from PostgreSQL through Kafka into Databricks, with
+automated data-quality enforcement at every step.
 
 ---
 
@@ -51,16 +68,16 @@ through Debezium and Kafka into Databricks Unity Catalog via the Medallion Archi
                     ▼
         Databricks Structured Streaming
         trigger(availableNow=True) — scales to zero
-        2 parametrized notebooks via DABs (20x bronze + 12x silver)
+        2 parametrized notebooks via DABs (20x bronze + 11x silver)
                     │
          ┌──────────┼──────────┐
          ▼          ▼          ▼
       Bronze     Silver      Gold
-   (20 tables)(12 tables)(6 tables)
+   (20 tables)(11 tables)(6 tables)
                     │
                     ▼
                Quarantine
-              (12 tables)
+              (11 tables)
 ```
 
 ---
@@ -77,7 +94,7 @@ through Debezium and Kafka into Databricks Unity Catalog via the Medallion Archi
 | Streaming | Databricks Structured Streaming | trigger(availableNow=True) |
 | Storage | Delta Lake 3.1 | Liquid Clustering + MERGE INTO |
 | Catalog | Unity Catalog | ubereats_dev / ubereats_prod |
-| Orchestration | Databricks Asset Bundles | GitOps-native, targets dev/prod |
+| Orchestration | Databricks Asset Bundles | GitOps-native, targets dev/prod/free_edition |
 | Contracts | YAML per table | loader + spark_schema + pydantic |
 | Alerting | DABs Notifications | Zero-config job alerting |
 | CI/CD | GitHub Actions | lint + contracts + bundle validate |
@@ -97,8 +114,10 @@ through Debezium and Kafka into Databricks Unity Catalog via the Medallion Archi
 | Unidirectional topology | Bidirectional JDBC Sink | Eliminates loop risk; sources are snapshot exports |
 | trigger(availableNow=True) | Continuous streaming | Scales to zero — no always-on cluster cost |
 | YAML Data Contracts | Schema hardcoded in code | Single source of truth for schema, quality rules, Delta props |
+| Dual `source_mode` (`kafka` / `volume`) | Enterprise-tier networking | Databricks Free Edition's serverless compute can't reach a self-hosted broker — built a Volume-backed batch fallback that shares the same MERGE/contract logic, so the same notebook runs on a $0 tier and a real cluster |
 
-> Full rationale in `docs/adr/` — 8 Architecture Decision Records.
+> Full rationale documented as ADRs in [`docs/adr/`](docs/adr/) (4 canonical write-ups); the
+> Free Edition constraints above are tracked directly in `CLAUDE.md` (ADR-05, ADR-06).
 
 ---
 
@@ -152,18 +171,22 @@ ubereats_dev/                     ← CATALOG (dev)
 │   ├── payment_events            ← raw flat records from Debezium
 │   ├── orders                    ← hub table (CPF/CNPJ/driver_id keys)
 │   └── [18 more domains]
-├── silver/                       ← SCHEMA — 12 tables
+├── silver/                       ← SCHEMA — 11 tables
 │   ├── payment_events            ← MERGE + quality rules + Liquid Cluster (event_id, event_ts)
 │   ├── users                     ← FULL OUTER JOIN users_mongo + users_mssql by CPF
-│   └── [10 more domains]
+│   └── [9 more domains]
 ├── gold/                         ← SCHEMA — 6 cross-domain analytics tables
 │   ├── payment_lifecycle         ← lifecycle summary per payment_id
 │   ├── driver_performance        ← earnings + delivery metrics per driver
 │   ├── revenue_per_restaurant    ← revenue by CNPJ (fact × dimension JOIN)
 │   └── [3 more models]
-└── quarantine/                   ← SCHEMA — 12 tables (mirrors Silver)
+├── quarantine/                   ← SCHEMA — 11 tables (mirrors Silver)
+├── checkpoints/                  ← 2 Volumes — Structured Streaming checkpoint locations
+└── landing/                      ← 1 Volume (kafka_export) — Parquet snapshot of the 20
+                                     Kafka topics, used by Bronze when source_mode=volume
+                                     (Databricks Free Edition; see ADR-05)
 
-ubereats_prod/                    ← CATALOG (prod) — same structure
+ubereats_prod/                    ← CATALOG (prod) — same structure, source_mode=kafka only
 ```
 
 ---
@@ -193,6 +216,9 @@ ubereats_prod/                    ← CATALOG (prod) — same structure
 | entity | ratings | MySQL | 327 |
 | entity | inventory | PostgreSQL | 261 |
 
+`orders` is the hub table — it links every other domain via CPF (customer), CNPJ
+(restaurant), `driver_id`, and payment/rating UUIDs.
+
 ---
 
 ## How to Run
@@ -201,7 +227,7 @@ ubereats_prod/                    ← CATALOG (prod) — same structure
 - Docker Desktop 4.x+
 - Python 3.11+
 - Databricks CLI 0.200+
-- Databricks workspace with Unity Catalog and DBR 14.1+
+- Databricks workspace with Unity Catalog and DBR 14.1+ (or a free [Databricks Free Edition](https://www.databricks.com/learn/free-edition) account)
 
 ### Local setup
 
@@ -294,7 +320,7 @@ of external Staff/Principal-level review before a single line of code was writte
 
 **On parametrized notebooks:**
 > "Instead of 60 static notebooks, we built 2 parametrized ones via dbutils.widgets.
-> DABs orchestrates them 20x and 12x with domain-specific configs — DRY principle applied to data engineering."
+> DABs orchestrates them 20x and 11x with domain-specific configs — DRY principle applied to data engineering."
 
 **On Liquid Clustering:**
 > "cluster_by must match the MERGE ON columns for Databricks to use file pruning during MERGE.
@@ -303,3 +329,21 @@ of external Staff/Principal-level review before a single line of code was writte
 **On dataset volume:**
 > "129k records is an architectural microcosm. We're validating MERGE idempotency,
 > contract governance, and clustering alignment — the design scales horizontally when real volume arrives."
+
+**On the Free Edition constraint:**
+> "Free Edition's serverless compute can't reach a self-hosted Kafka broker — outbound
+> networking is locked to a fixed allowlist below the Enterprise tier. Rather than fork the
+> pipeline, Bronze takes a `source_mode` parameter: `kafka` for dev/prod, `volume` for a
+> batch read off a Parquet snapshot in Free Edition. Same contract, same MERGE, same
+> idempotency guarantees — only the read path changes."
+
+---
+
+## License
+
+[MIT](LICENSE) — free to use, modify, and learn from.
+
+## Author
+
+Built by [Christian Rocha](https://github.com/christiandrocha) as a hands-on exploration of
+streaming CDC architecture on Databricks. Feedback and questions welcome via GitHub issues.
