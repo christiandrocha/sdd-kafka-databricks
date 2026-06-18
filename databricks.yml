@@ -672,46 +672,131 @@ variables:
         - <<: *gold_user_behavior_task
           job_cluster_key: ubereats_cluster
 
-      # Same 37 tasks, serverless compute — direct aliases, no job_cluster_key at all.
-      # Used only by the free_edition target.
+      # Same 37 tasks, serverless compute — no job_cluster_key at all. Used only by
+      # the free_edition target. Unlike classic_tasks, this is NOT a flat list of
+      # aliases: depends_on is overridden per task to collapse the natural 3-tier
+      # fan-out (20 Bronze / 11 Silver / 6 Gold, all independent within their tier)
+      # into sequential batches of <=4. Free Edition serverless can't sustain that
+      # many concurrent Spark sessions — each layer's first batch is gated on the
+      # previous layer's last batch finishing entirely, so at most 4 tasks ever run
+      # at once. See ADR-06 addendum / .claude/05_implementation_log.md.
       serverless_tasks: &serverless_tasks
+        # Bronze batch 1 — no upstream, starts immediately
         - *bronze_payment_events_task
         - *bronze_gps_events_task
         - *bronze_order_status_task
         - *bronze_search_events_task
-        - *bronze_recommendations_task
-        - *bronze_order_items_task
-        - *bronze_orders_task
-        - *bronze_payments_task
-        - *bronze_routes_task
-        - *bronze_receipts_task
-        - *bronze_driver_shifts_task
-        - *bronze_support_tickets_task
-        - *bronze_users_mongo_task
-        - *bronze_users_mssql_task
-        - *bronze_restaurants_task
-        - *bronze_drivers_task
-        - *bronze_products_task
-        - *bronze_menu_sections_task
-        - *bronze_ratings_task
-        - *bronze_inventory_task
-        - *silver_payment_events_task
-        - *silver_orders_task
-        - *silver_payments_task
-        - *silver_drivers_task
-        - *silver_order_items_task
-        - *silver_driver_shifts_task
-        - *silver_restaurants_task
-        - *silver_order_status_task
-        - *silver_search_events_task
-        - *silver_recommendations_task
-        - *silver_users_task
-        - *gold_payments_by_status_task
-        - *gold_payment_funnel_task
-        - *gold_payment_lifecycle_task
-        - *gold_driver_performance_task
-        - *gold_revenue_per_restaurant_task
-        - *gold_user_behavior_task
+        # Bronze batch 2
+        - <<: *bronze_recommendations_task
+          depends_on: &bronze_b1
+            - task_key: bronze_payment_events
+            - task_key: bronze_gps_events
+            - task_key: bronze_order_status
+            - task_key: bronze_search_events
+        - <<: *bronze_order_items_task
+          depends_on: *bronze_b1
+        - <<: *bronze_orders_task
+          depends_on: *bronze_b1
+        - <<: *bronze_payments_task
+          depends_on: *bronze_b1
+        # Bronze batch 3
+        - <<: *bronze_routes_task
+          depends_on: &bronze_b2
+            - task_key: bronze_recommendations
+            - task_key: bronze_order_items
+            - task_key: bronze_orders
+            - task_key: bronze_payments
+        - <<: *bronze_receipts_task
+          depends_on: *bronze_b2
+        - <<: *bronze_driver_shifts_task
+          depends_on: *bronze_b2
+        - <<: *bronze_support_tickets_task
+          depends_on: *bronze_b2
+        # Bronze batch 4
+        - <<: *bronze_users_mongo_task
+          depends_on: &bronze_b3
+            - task_key: bronze_routes
+            - task_key: bronze_receipts
+            - task_key: bronze_driver_shifts
+            - task_key: bronze_support_tickets
+        - <<: *bronze_users_mssql_task
+          depends_on: *bronze_b3
+        - <<: *bronze_restaurants_task
+          depends_on: *bronze_b3
+        - <<: *bronze_drivers_task
+          depends_on: *bronze_b3
+        # Bronze batch 5
+        - <<: *bronze_products_task
+          depends_on: &bronze_b4
+            - task_key: bronze_users_mongo
+            - task_key: bronze_users_mssql
+            - task_key: bronze_restaurants
+            - task_key: bronze_drivers
+        - <<: *bronze_menu_sections_task
+          depends_on: *bronze_b4
+        - <<: *bronze_ratings_task
+          depends_on: *bronze_b4
+        - <<: *bronze_inventory_task
+          depends_on: *bronze_b4
+
+        # Silver batch 1 — gated on all Bronze finishing (last Bronze batch)
+        - <<: *silver_payment_events_task
+          depends_on: &bronze_b5
+            - task_key: bronze_products
+            - task_key: bronze_menu_sections
+            - task_key: bronze_ratings
+            - task_key: bronze_inventory
+        - <<: *silver_orders_task
+          depends_on: *bronze_b5
+        - <<: *silver_payments_task
+          depends_on: *bronze_b5
+        - <<: *silver_drivers_task
+          depends_on: *bronze_b5
+        # Silver batch 2
+        - <<: *silver_order_items_task
+          depends_on: &silver_b1
+            - task_key: silver_payment_events
+            - task_key: silver_orders
+            - task_key: silver_payments
+            - task_key: silver_drivers
+        - <<: *silver_driver_shifts_task
+          depends_on: *silver_b1
+        - <<: *silver_restaurants_task
+          depends_on: *silver_b1
+        - <<: *silver_order_status_task
+          depends_on: *silver_b1
+        # Silver batch 3
+        - <<: *silver_search_events_task
+          depends_on: &silver_b2
+            - task_key: silver_order_items
+            - task_key: silver_driver_shifts
+            - task_key: silver_restaurants
+            - task_key: silver_order_status
+        - <<: *silver_recommendations_task
+          depends_on: *silver_b2
+        - <<: *silver_users_task
+          depends_on: *silver_b2
+
+        # Gold batch 1 — gated on all Silver finishing (last Silver batch)
+        - <<: *gold_payments_by_status_task
+          depends_on: &silver_b3
+            - task_key: silver_search_events
+            - task_key: silver_recommendations
+            - task_key: silver_users
+        - <<: *gold_payment_funnel_task
+          depends_on: *silver_b3
+        - <<: *gold_payment_lifecycle_task
+          depends_on: *silver_b3
+        # Gold batch 2
+        - <<: *gold_driver_performance_task
+          depends_on: &gold_b1
+            - task_key: gold_payments_by_status
+            - task_key: gold_payment_funnel
+            - task_key: gold_payment_lifecycle
+        - <<: *gold_revenue_per_restaurant_task
+          depends_on: *gold_b1
+        - <<: *gold_user_behavior_task
+          depends_on: *gold_b1
 
       email_notifications: &email_notifications
         on_failure:
@@ -731,8 +816,8 @@ variables:
     description: "kafka (streaming, default) or volume (batch, Free Edition)"
     default: kafka
   workspace_root:
-    description: Absolute workspace path to bundle root — resolves contract YAML file paths at runtime
-    default: /Workspace/Repos/christiandr@gmail.com/sdd-kafka-databricks
+    description: Absolute workspace path to deployed bundle source files — resolves contract YAML file paths at runtime
+    default: ${workspace.file_path}
   kafka_bootstrap:
     description: Kafka bootstrap servers
     default: localhost:9092
@@ -785,6 +870,10 @@ targets:
       jobs:
         ubereats_pipeline:
           name: ubereats_pipeline
+          max_concurrent_runs: 1
           email_notifications: *email_notifications
           tasks: *serverless_tasks
           # No job_clusters — Free Edition only supports serverless compute.
+          # max_concurrent_runs caps overlapping *runs* of this job; task-level
+          # concurrency within a single run is capped separately via depends_on
+          # batching in serverless_tasks above (max 4 tasks running at once).

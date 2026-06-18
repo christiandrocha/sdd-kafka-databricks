@@ -744,3 +744,61 @@ unrelated to this feature)
   declared in the source YAML.
 
 ### Status: resolved
+
+---
+
+## 2026-06-18 — databricks.yml — workspace_root pointed at a Repos path no target uses
+
+### Problems encountered
+- `var.workspace_root` (used to build every `contract_path` base parameter) defaulted
+  to `/Workspace/Repos/christiandr@gmail.com/sdd-kafka-databricks`. The global
+  `workspace.root_path` had already been migrated to
+  `/Workspace/Users/christiandr@gmail.com/.bundle/${bundle.name}/${bundle.target}`
+  for all three targets, so after `bundle deploy` the contracts actually land under
+  `.../.bundle/sdd-kafka-databricks/<target>/files/contracts/`. The stale default
+  surfaced first on `free_edition` (the target actually being run), but `dev`/`prod`
+  carried the identical latent bug.
+  → Solution: replaced the `workspace_root` variable's `default` with the predefined
+    bundle variable `${workspace.file_path}`, which DABs resolves per-target to
+    `<root_path>/files` — the exact directory `contracts/` is synced into. Fixes all
+    three targets with a single line, no per-target override needed.
+  → Status: resolved
+
+### Verification
+- `databricks bundle validate -t dev|prod|free_edition` — all three: `Validation OK!`
+- `databricks bundle validate -t <target> -o json`, parsed `contract_path` on
+  resolved tasks: each target now resolves to its own correct
+  `.../.bundle/sdd-kafka-databricks/<target>/files/contracts/{table}.yml`.
+
+### Status: resolved
+
+---
+
+## 2026-06-18 — databricks.yml — free_edition fanned out too many concurrent Spark sessions
+
+### Problems encountered
+- `serverless_tasks` (used only by `free_edition`) let all 20 Bronze tasks start
+  with zero `depends_on`, all 11 Silver tasks start as soon as their one Bronze
+  dependency finished, and all 6 Gold tasks start as soon as their Silver
+  dependencies finished — up to 20-way fan-out at job start. Free Edition's
+  serverless compute can't sustain that many concurrent Spark sessions.
+  → Solution: added `max_concurrent_runs: 1` to the `free_edition`
+    `ubereats_pipeline` job (no overlapping job runs), and rewrote `serverless_tasks`
+    to override `depends_on` per task, collapsing the natural 3-tier fan-out into
+    sequential batches of ≤4: Bronze 5×4, Silver 4+4+3, Gold 3+3. Each layer's first
+    batch is gated on the previous layer's last batch finishing entirely, so
+    correctness (every task's real upstream dependency) is preserved — at most 4
+    tasks ever run concurrently. `classic_tasks` (`dev`/`prod`) is unchanged.
+  → Status: resolved
+
+### Verification
+- `databricks bundle validate -t free_edition` — `Validation OK!`
+- `databricks bundle validate -t free_edition -o json`, parsed: 37 tasks present,
+  `max_concurrent_runs: 1`, no task has more than 4 entries in `depends_on`, and
+  every task's resolved `depends_on` set is a superset of its original semantic
+  dependency (e.g. `silver_users` still only becomes runnable after both
+  `bronze_users_mongo` and `bronze_users_mssql`, now via the Bronze batch gate).
+- `databricks bundle validate -t dev -o json` — still 37 tasks, `job_clusters`
+  present, confirming `classic_tasks`/dev/prod were not touched.
+
+### Status: resolved
