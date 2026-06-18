@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from contracts.loader import load_contract
+from contracts.loader import VALID_CHECKS, _validate_quality, load_contract
 from contracts.spark_schema import to_tblproperties
 
 CONTRACTS_DIR = Path("contracts")
@@ -82,4 +82,43 @@ def test_07_tblproperties_values_are_strings(contract_path: Path) -> None:
         assert isinstance(value, str), (
             f"{contract_path.stem}: TBLPROPERTIES['{key}'] = {value!r}"
             f" must be str, not {type(value).__name__}"
+        )
+
+
+def test_08_unique_is_a_valid_check() -> None:
+    assert "unique" in VALID_CHECKS
+
+
+@pytest.mark.parametrize("contract_path", ALL_CONTRACTS, ids=_IDS)
+def test_09_drivers_and_restaurants_declare_unique_rule(contract_path: Path) -> None:
+    # DESIGN_GOLD_DIMENSION_JOIN_INTEGRITY.md: the column each Gold notebook joins
+    # on (driver_id, cnpj) is not the table's merge_key, so it needs its own
+    # uniqueness guarantee.
+    contract = load_contract(contract_path)
+    expected_unique_field = {"drivers": "driver_id", "restaurants": "cnpj"}.get(
+        contract["table"]["name"]
+    )
+    if expected_unique_field is None:
+        return
+    unique_fields = {r["field"] for r in contract["quality"]["rules"] if r["check"] == "unique"}
+    assert expected_unique_field in unique_fields, (
+        f"{contract_path.stem}: expected a check=unique rule on '{expected_unique_field}'"
+    )
+
+
+def test_10_unknown_check_type_is_rejected() -> None:
+    with pytest.raises(ValueError, match="invalid check"):
+        _validate_quality(
+            "fake_table",
+            {"some_field"},
+            {
+                "rules": [
+                    {
+                        "field": "some_field",
+                        "check": "bogus",
+                        "on_failure": "quarantine",
+                        "scope": ["silver"],
+                    }
+                ]
+            },
         )

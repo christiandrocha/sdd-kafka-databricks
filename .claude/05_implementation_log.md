@@ -902,3 +902,76 @@ unrelated to this feature)
   valid JSON, 6 cells (unchanged count, `md-title` and `cell-transform` edited).
 
 ### Status: resolved
+
+---
+
+## 2026-06-18 — GOLD_DIMENSION_JOIN_INTEGRITY — unicidade forçada no Silver + guard no Gold
+
+### Context
+Build a partir de `.claude/sdd/features/DESIGN_GOLD_DIMENSION_JOIN_INTEGRITY.md`, decidindo
+entre as duas abordagens levantadas pela auditoria de linhagem Gold (ver entradas anteriores
+deste log). Decisão: híbrido — `merge_key` inalterado em todos os contratos; novo tipo de
+regra de qualidade `check: unique` aplicada no Silver na coluna que cada Gold realmente usa no
+JOIN; guard `row_number()` retrofitado nos 2 Gold que ainda não tinham.
+
+### Implemented
+- `contracts/loader.py`: `"unique"` adicionado a `VALID_CHECKS`.
+- `contracts/drivers.yml` / `contracts/restaurants.yml`: nova regra
+  `check: unique` em `driver_id` / `cnpj` respectivamente (`merge_key` continua `uuid`).
+- `notebooks/pipeline_silver.ipynb`: `apply_quality_rules` ganhou um terceiro parâmetro
+  (`silver_table`) e uma nova função `_unique_violation_values` (anti-join contra a tabela
+  Silver existente + checagem de duplicata dentro do próprio batch); call site em
+  `process_silver_batch` atualizado.
+- `notebooks/pipeline_users.ipynb`: checagem de unicidade de `user_id` adicionada em
+  `cell-join`, roteando duplicatas para `quarantine_table` com
+  `_quarantine_reason="duplicate_user_id"` — mesmo padrão já usado para CPF ausente.
+- `notebooks/cross_domain/gold_driver_performance.ipynb` e
+  `gold_revenue_per_restaurant.ipynb`: guard `row_number()` antes do `MERGE`, mesmo padrão já
+  existente em `gold_user_behavior.ipynb`.
+- `docs/adr/005_gold_dimension_join_integrity.md`: novo ADR documentando a decisão.
+- `CLAUDE.md`: nova entrada em "Critical architecture decisions".
+- `tests/test_contracts.py`: `test_08_unique_is_a_valid_check`,
+  `test_09_drivers_and_restaurants_declare_unique_rule`,
+  `test_10_unknown_check_type_is_rejected`.
+
+### Problems encountered
+- O Pattern 4 do DESIGN (checagem de unicidade para `user_id` via anti-join contra uma
+  tabela "existente") assumia implicitamente um padrão incremental, igual ao de
+  `pipeline_silver.ipynb`. Relendo `pipeline_users.ipynb::cell-write` durante o build,
+  confirmei que `silver.users` é **full refresh** (`mode("overwrite")`) a cada execução, não
+  `MERGE` incremental — não há "estado anterior" significativo para fazer anti-join.
+  → Solução: implementação simplificada — checagem só dentro do batch atual
+    (`groupBy("user_id").count() > 1`), suficiente porque cada execução recomputa
+    `silver.users` do zero a partir do Bronze atual.
+  → Status: resolved (divergência do DESIGN registrada no BUILD_REPORT, dentro do que o
+    próprio DESIGN já previa como ajuste esperado em build-time)
+
+### Decisions made during build
+- Nenhum agente especializado foi de fato invocado via `Task` — todas as edições (YAML, 1
+  linha em Python, edições de notebook bem delimitadas) foram feitas diretamente, mesmo onde
+  o DESIGN sugeria `@data-quality-analyst`/`@spark-engineer`. Build pequeno e mecânico o
+  suficiente para não justificar a delegação.
+
+### Verification
+- `python3 -m pytest tests/test_contracts.py -q` → 163 passed (141 → 163, 0 regressões).
+- `ruff check .` → All checks passed.
+- `python3 -c "import json; json.load(open(...))"` em todos os 4 notebooks tocados → válidos.
+- `make lint` falhou em `yamllint contracts/` por `yamllint` não estar instalado neste
+  ambiente — pré-existente, não relacionado a esta mudança.
+- Validação live contra um workspace Databricks real (anti-join de `check: unique` rodando
+  de fato, guards `row_number()` com dado real) **não executada** — mesma limitação de
+  ambiente já documentada nas features anteriores (FREE_EDITION_BRONZE, V1.0.1).
+
+### Open questions
+- Numeração de ADR inconsistente, encontrada de passagem (não é desta feature): CLAUDE.md já
+  referenciava "ADR-05"/"ADR-06" para o `source_mode` do Free Edition e os anchors do
+  `databricks.yml`, mas `.claude/03_design.md` já tinha ADR-05 ("Confluent Schema Registry")
+  e ADR-06 ("unidirectional CDC") atribuídos a decisões completamente diferentes — e nenhum
+  `docs/adr/005_*.md`/`006_*.md` jamais existiu para nenhum dos dois sentidos. Por isso o
+  ADR desta feature foi criado como `docs/adr/005_gold_dimension_join_integrity.md` (próximo
+  número sequencial *dentro da própria pasta* `docs/adr/`, que só tinha 001–004) e referenciado
+  em CLAUDE.md pelo caminho do arquivo, não por um novo "ADR-NN" — para não aprofundar a
+  colisão já existente. Flagado para `/design` revisar a numeração de ADRs do projeto como um
+  todo.
+
+### Status: resolved

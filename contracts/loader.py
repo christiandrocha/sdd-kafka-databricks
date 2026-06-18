@@ -8,7 +8,7 @@ import yaml
 VALID_TYPES: frozenset[str] = frozenset(
     {"string", "integer", "long", "double", "boolean", "timestamp", "date"}
 )
-VALID_CHECKS: frozenset[str] = frozenset({"not_null", "allowed_values", "not_future"})
+VALID_CHECKS: frozenset[str] = frozenset({"not_null", "allowed_values", "not_future", "unique"})
 VALID_SCOPES: frozenset[str] = frozenset({"bronze", "silver"})
 
 

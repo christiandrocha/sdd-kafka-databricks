@@ -28,6 +28,7 @@ quality:
   rules:
     - { field: uuid,                 check: not_null,   on_failure: reject,     severity: critical, scope: [bronze]         }
     - { field: cnpj,                 check: not_null,   on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: cnpj,                 check: unique,     on_failure: quarantine, severity: critical, scope: [silver]         }
     - { field: dt_current_timestamp, check: not_future, on_failure: warn,       severity: warning,  scope: [bronze, silver] }
 
 storage:

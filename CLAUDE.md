@@ -69,6 +69,25 @@ each target (`dev`, `prod`, `free_edition`) owns its own
 `resources.jobs.ubereats_pipeline`, referencing either `classic_tasks` (with
 `job_cluster_key`) or `serverless_tasks` (without). See ADR-06.
 
+**Gold dimension joins must target a column enforced unique in Silver**
+3 of the 6 Gold notebooks join a Silver dimension on a column that is not that
+table's `merge_key` (`gold_user_behavior` → `silver.users.user_id`, real key
+`cpf`; `gold_driver_performance` → `silver.drivers.driver_id`, real key
+`uuid`; `gold_revenue_per_restaurant` → `silver.restaurants.cnpj`, real key
+`uuid`). Nothing guaranteed those columns were unique, which already caused a
+`DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE` failure once
+(`gold_user_behavior`). Fixed with two layers, not one: (1) a new contract
+quality-rule type, `check: unique`, enforced in Silver via anti-join against
+the existing table (`contracts/drivers.yml`/`contracts/restaurants.yml`,
+implemented in `pipeline_silver.ipynb`; `pipeline_users.ipynb` has the
+equivalent by hand for `user_id` since `users` has no YAML contract) —
+violations are quarantined, not silently dropped or resolved; (2) a
+`row_number()` guard kept right before every affected Gold `MERGE`, as
+defense-in-depth for rows that landed before the rule existed. `merge_key`
+itself is never changed — it stays the real CDC identity (`uuid`/`cpf`), not
+the column Gold happens to join on. See
+`docs/adr/005_gold_dimension_join_integrity.md`.
+
 ## Unity Catalog structure
 
 ```
