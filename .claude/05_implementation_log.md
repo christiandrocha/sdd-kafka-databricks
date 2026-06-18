@@ -975,3 +975,82 @@ JOIN; guard `row_number()` retrofitado nos 2 Gold que ainda não tinham.
   todo.
 
 ### Status: resolved
+
+## 2026-06-18 — LAKEFLOW_MIGRATION (v1.1.0): Bronze+Silver em Databricks Lakeflow
+
+### Implemented
+- `contracts/dlt_adapter.py` — traduz um contrato já carregado (`contracts/loader.py`) em
+  expectations/predicados DLT, sem alterar o formato `contracts/*.yml`:
+  `to_reject_expectations`, `to_warn_expectations`, `quarantine_row_level_predicate`,
+  `unique_check_fields`, `_condition_sql`.
+- `pipelines/bronze_silver_dlt.py` — `pyspark.pipelines as dp` (API atual, não o alias
+  legado `dlt`), loop sobre os 20 contratos: 1 `@dp.table` Bronze por domínio + 1 par
+  Silver/quarentena (10 de 11 domínios — `users_mongo`/`users_mssql` ficam só com Bronze,
+  ver Decisions) usando `dp.create_auto_cdc_flow` (renome de `apply_changes`) para o upsert
+  por `merge_key`, e um *stream-static join* dentro da tabela de quarentena para portar
+  `check: unique` (sem equivalente nativo em `@dp.expect`).
+- `databricks.yml` — novo `resources.pipelines.ubereats_bronze_silver` (dev/prod, dentro do
+  `resources:` de cada target, não na raiz — mesmo motivo do ADR-06 original,
+  [databricks/cli#2872](https://github.com/databricks/cli/issues/2872)); os 30 tasks
+  `bronze_*`/`silver_*` substituídos por 1 `pipeline_task` para dev/prod; `free_edition`
+  inalterado (ainda os 37 tasks originais).
+- `docs/adr/006_lakeflow_migration.md` — documenta a sobrescrita do escopo Bronze/Silver do
+  ADR-03, sem editar o ADR original.
+- `CLAUDE.md` — nova entrada de decisão, tabelas "Platform at a glance"/"What changed"
+  atualizadas, versão bumped para v1.1.0.
+- `tests/test_dlt_adapter.py` — 33 testes novos (parametrizados nos 20 contratos reais +
+  casos sintéticos para cada tipo de `check`/`on_failure`).
+
+### Problems encountered
+- 2 dos 12 contratos com `layers: [bronze, silver]` (`users_mongo`, `users_mssql`) não usam
+  o MERGE genérico de Silver hoje — alimentam o FULL OUTER JOIN bespoke de
+  `pipeline_users.ipynb`. O esboço do DESIGN não deixava essa exclusão explícita.
+  → Solução: `SILVER_EXCLUDED_DOMAINS = {"users_mongo", "users_mssql"}` no loop — ambos
+    continuam recebendo Bronze do novo pipeline, só pulam o par Silver/quarentena genérico.
+- `classic_tasks` (anchor de 37 entradas) ficou completamente sem uso depois que dev/prod
+  passaram a usar `lakeflow_tasks`.
+  → Solução: removido (YAML morto), comentários adjacentes atualizados.
+- `ruff check pipelines/bronze_silver_dlt.py` (caminho explícito) reporta `F821` para
+  `spark`/`dbutils` — globals injetados pelo runtime Databricks, ignorando o `exclude` do
+  `pyproject.toml`. `ruff check .` (sem caminho explícito) respeita o `exclude` normalmente.
+  → Solução: adicionado `pipelines` ao mesmo `exclude` que já protegia `notebooks` pelo
+    mesmo motivo — não um padrão novo, o mesmo já estabelecido.
+- `databricks bundle validate -t dev` falhou por OAuth refresh token expirado — mesma
+  limitação de ambiente das features anteriores (sem autenticação Databricks ao vivo neste
+  sandbox).
+  → Substituído por verificação estrutural via `yaml.safe_load` (anchors resolvem, contagem
+    de tasks, `depends_on` sem nenhum `task_key` `bronze_*`/`silver_*` órfão,
+    `free_edition` byte-a-byte idêntico antes/depois).
+
+### Decisions made during build
+- Todos os 6 arquivos do manifesto construídos diretamente, sem delegar a
+  `@lakeflow-pipeline-builder`/`@ci-cd-specialist`/`@data-quality-analyst` como o DESIGN
+  sugeria — as partes de maior risco exigiam manter o conteúdo completo dos arquivos
+  existentes e o raciocínio do DESIGN no mesmo contexto.
+- `MAX_OFFSETS_OVERRIDES = {"order_items": 5000}` adicionado no Python do pipeline (ADR-08),
+  já que o parâmetro por-task do DABs deixou de existir para os domínios migrados.
+
+### Verification
+- `python3 -m pytest -q` → 196 passed (163 → 196, 0 regressões).
+- `ruff check .` → All checks passed.
+- `python3 -c "import ast; ast.parse(...)"` em `pipelines/bronze_silver_dlt.py` → sintaxe OK
+  (não importável neste ambiente — `pyspark`/`pyspark.pipelines` não instalados, mesma
+  limitação que já existia para os notebooks).
+- `yaml.safe_load` em `databricks.yml` → parse OK; `free_edition` confirmado idêntico
+  antes/depois; `dev`/`prod` com 8 tasks cada, todos os 7 não-pipeline com
+  `depends_on: [bronze_silver_pipeline]`.
+- Validação live contra um workspace Databricks real (pipeline Lakeflow rodando de fato,
+  stream-static join de `check: unique`, `create_auto_cdc_flow`) **não executada** — mesma
+  limitação de ambiente já documentada em todas as features anteriores.
+
+### Open questions
+- Numeração de ADR ainda inconsistente (pré-existente, não criada por esta feature):
+  `docs/adr/006_lakeflow_migration.md` é o próximo número sequencial *dentro da pasta*
+  `docs/adr/`, mas não corresponde a nenhum "ADR-06" informal já mencionado em outro lugar
+  do projeto. Mesma mitigação já usada em `005_gold_dimension_join_integrity.md`:
+  referenciado em `CLAUDE.md` pelo caminho do arquivo, não por um número.
+- A4 (loop gerando múltiplas tabelas Lakeflow dinamicamente) e a parte de stream-static join
+  dentro de uma função `@dp.table` não foram confirmadas contra um workspace real — maior
+  risco técnico residual desta feature, registrado no BUILD_REPORT e no ADR.
+
+### Status: resolved

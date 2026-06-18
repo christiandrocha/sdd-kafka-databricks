@@ -1,4 +1,4 @@
-# sdd-kafka-databricks v1.0.0
+# sdd-kafka-databricks v1.1.0
 
 **Platform:** Uber Eats food delivery (Brazilian market)
 **Pipeline:** JSON exports → PostgreSQL → Debezium → Kafka → Databricks → Unity Catalog → DABs
@@ -14,7 +14,8 @@
 | Largest table | order_items (110,001 — 85% of volume) |
 | Hub table | orders (links all via CPF, CNPJ, driver_id, UUID) |
 | Unity Catalog | ubereats_dev / ubereats_prod |
-| Notebooks | 2 parametrized (bronze + silver) + 6 cross-domain gold |
+| Bronze+Silver execution | Lakeflow pipeline (dev/prod) or 2 parametrized notebooks (free_edition) — see below |
+| Notebooks | silver_users (1) + 6 cross-domain gold + 2 parametrized bronze/silver (free_edition only) |
 | Silver domains | 11 (payment_current_state dropped — covered by gold_payment_lifecycle) |
 
 ## What changed from sdd-kafka-snowflake
@@ -22,7 +23,7 @@
 | Component | sdd-kafka-snowflake | sdd-kafka-databricks |
 |---|---|---|
 | Destination | Snowflake Sink Connector | Databricks Structured Streaming |
-| Transformation | dbt | Parametrized PySpark notebooks |
+| Transformation | dbt | Lakeflow Declarative Pipelines (dev/prod) + parametrized PySpark notebooks (free_edition) |
 | Orchestration | Dagster | Databricks Asset Bundles (DABs) |
 | Storage | Snowflake VARIANT | Delta Lake 3.1 + Liquid Clustering |
 | Catalog | Snowflake schemas | Unity Catalog (ubereats_dev/prod) |
@@ -38,10 +39,29 @@ Debezium envelope — there is no unwrap step in Silver. Topology is
 unidirectional (JSON exports → Postgres → Debezium → Kafka), so the
 audit-trail argument for skipping the SMT does not apply here. See ADR-02.
 
-**2 parametrized notebooks, not 60**
+**2 parametrized notebooks, not 60 — free_edition only since v1.1.0**
 pipeline_bronze.ipynb and pipeline_silver.ipynb receive table_name, kafka_topic,
 contract_path as widgets. DABs orchestrates them 20x (bronze) and 11x (silver).
-See ADR-03.
+See ADR-03. As of v1.1.0 this only runs for the `free_edition` target — `dev`/`prod`
+use the Lakeflow pipeline below instead. Both notebooks remain fully functional
+and unmodified; `free_edition`'s 37-task job is byte-for-byte unchanged.
+
+**Bronze+Silver on Lakeflow Declarative Pipelines (dev/prod, v1.1.0)**
+`pipelines/bronze_silver_dlt.py` loops over `contracts/*.yml` and registers one
+`@dp.table` per Bronze domain (20) and one Silver `@dp.table` + quarantine pair
+per Silver domain (10 of the 11 — `silver_users` keeps its own notebook, see
+below), replacing the 30 `bronze_*`/`silver_*` DABs tasks with a single
+`pipeline_task` for `dev`/`prod`. This directly fixes Unity Catalog Lineage
+grouping every parametrized notebook execution under one node — each domain is
+now its own lineage node. `dlt.create_auto_cdc_flow()` (the renamed
+`apply_changes()`) replaces the hand-written `MERGE INTO` for the `merge_key`
+upsert; `check: unique` (see below) is a stream-static join inside the
+quarantine table's function body, since `@dp.expect` can't express cross-row
+checks. This deliberately overrides ADR-03's original rejection of DLT/Lakeflow
+for Bronze+Silver only — Gold, `silver_users`, and `free_edition` keep ADR-03's
+original reasoning ("less explicit control"), since none of them has the
+lineage-grouping problem this migration fixes. See
+`docs/adr/006_lakeflow_migration.md`.
 
 **Dataset framing**
 129k records is an architectural microcosm, not a production volume.
@@ -79,8 +99,10 @@ table's `merge_key` (`gold_user_behavior` → `silver.users.user_id`, real key
 (`gold_user_behavior`). Fixed with two layers, not one: (1) a new contract
 quality-rule type, `check: unique`, enforced in Silver via anti-join against
 the existing table (`contracts/drivers.yml`/`contracts/restaurants.yml`,
-implemented in `pipeline_silver.ipynb`; `pipeline_users.ipynb` has the
-equivalent by hand for `user_id` since `users` has no YAML contract) —
+translated by `contracts/dlt_adapter.py` for the Lakeflow pipeline in dev/prod
+and implemented directly in `pipeline_silver.ipynb` for free_edition;
+`pipeline_users.ipynb` has the equivalent by hand for `user_id` since `users`
+has no YAML contract) —
 violations are quarantined, not silently dropped or resolved; (2) a
 `row_number()` guard kept right before every affected Gold `MERGE`, as
 defense-in-depth for rows that landed before the rule existed. `merge_key`

@@ -2,15 +2,25 @@
 # Pipeline: JSON exports → PostgreSQL → Debezium → Kafka → Databricks → Unity Catalog
 # Platform: Uber Eats food delivery (Brazilian market)
 # Targets: ubereats_dev (development) / ubereats_prod (production) / free_edition (serverless)
-# Tasks: 37 total — 20 Bronze + 10 Silver + 1 Users + 6 Gold
 #
-# Compute: dev/prod use a classic job cluster (job_cluster_key); free_edition uses
-# serverless (no job_clusters at all — Free Edition doesn't support custom compute).
+# dev/prod: Bronze (20 domains) + Silver (10 of 11 domains) run as a single Lakeflow
+# Declarative Pipeline (resources.pipelines.ubereats_bronze_silver, see
+# pipelines/bronze_silver_dlt.py) — docs/adr/006_lakeflow_migration.md. The job has 8
+# tasks: 1 pipeline_task + silver_users + 6 gold_*, all depending on the pipeline_task.
+#
+# free_edition: unchanged, all 37 original notebook tasks (20 Bronze + 10 Silver + 1
+# Users + 6 Gold) — Lakeflow serverless support there hasn't been verified, so it keeps
+# running pipeline_bronze.ipynb/pipeline_silver.ipynb (source_mode=volume).
+#
+# Compute: dev/prod use a classic job cluster (job_cluster_key) for the 7 remaining
+# notebook tasks — the Lakeflow pipeline manages its own compute separately; free_edition
+# uses serverless (no job_clusters at all — Free Edition doesn't support custom compute).
 # DABs has no way to exclude a root-level resource from a single target
-# (https://github.com/databricks/cli/issues/2872), so each job lives entirely inside
-# its target's own `resources:` block. The 37 tasks are defined once as YAML anchors
-# and reused by both job bodies via merge keys — see `classic_tasks`/`serverless_tasks`
-# below. The anchors live under `variables._pipeline_anchors.default` (rather than as
+# (https://github.com/databricks/cli/issues/2872), so each job/pipeline lives entirely
+# inside its target's own `resources:` block. The task_definitions anchors (still 37 —
+# free_edition needs all of them) and the new lakeflow_tasks/bronze_silver_pipeline_*
+# anchors are reused via merge keys — see `lakeflow_tasks`/`serverless_tasks` below.
+# The anchors live under `variables._pipeline_anchors.default` (rather than as
 # root-level fields) because the DABs schema validator warns on unrecognized
 # top-level fields — `variables.<name>.default` accepts arbitrary YAML/JSON, so it's
 # the only schema-sanctioned home for anchor-only scaffolding. This variable is never
@@ -581,6 +591,69 @@ variables:
             base_parameters:
               catalog: ${var.catalog}
 
+      # LAKEFLOW_MIGRATION (v1.1.0): Bronze (20 domains) + Silver (10 of the 11 domains —
+      # silver_users keeps its own bronze_users_mongo/bronze_users_mssql depends_on, see
+      # below) are now a single Lakeflow Spark Declarative Pipeline, dev/prod only. Each
+      # domain gets its own @dp.table — Unity Catalog Lineage now resolves per domain
+      # instead of grouping every parametrized execution under one notebook path. See
+      # docs/adr/006_lakeflow_migration.md. free_edition is untouched: serverless_tasks
+      # below still runs bronze_*/silver_* as the original 30 notebook tasks.
+      bronze_silver_pipeline_resource: &bronze_silver_pipeline_resource
+        name: ubereats_bronze_silver
+        catalog: ${var.catalog}
+        continuous: false
+        libraries:
+          - file:
+              path: pipelines/bronze_silver_dlt.py
+        configuration:
+          ubereats.catalog: ${var.catalog}
+          ubereats.kafka_bootstrap: ${var.kafka_bootstrap}
+          ubereats.schema_registry_url: ${var.schema_registry_url}
+          ubereats.starting_offsets: earliest
+
+      bronze_silver_pipeline_task: &bronze_silver_pipeline_task
+        task_key: bronze_silver_pipeline
+        pipeline_task:
+          pipeline_id: ${resources.pipelines.ubereats_bronze_silver.id}
+          full_refresh: false
+
+      # dev/prod task list: the pipeline_task above replaces the 20 bronze_*/10 silver_*
+      # tasks from classic_tasks. silver_users and the 6 gold_* keep their own notebook
+      # tasks, with depends_on pointed at bronze_silver_pipeline instead of the individual
+      # bronze_*/silver_* task_keys that no longer exist in this target's job.
+      lakeflow_tasks: &lakeflow_tasks
+        - *bronze_silver_pipeline_task
+
+        - <<: *silver_users_task
+          depends_on:
+            - task_key: bronze_silver_pipeline
+          job_cluster_key: ubereats_cluster
+
+        - <<: *gold_payments_by_status_task
+          depends_on:
+            - task_key: bronze_silver_pipeline
+          job_cluster_key: ubereats_cluster
+        - <<: *gold_payment_funnel_task
+          depends_on:
+            - task_key: bronze_silver_pipeline
+          job_cluster_key: ubereats_cluster
+        - <<: *gold_payment_lifecycle_task
+          depends_on:
+            - task_key: bronze_silver_pipeline
+          job_cluster_key: ubereats_cluster
+        - <<: *gold_driver_performance_task
+          depends_on:
+            - task_key: bronze_silver_pipeline
+          job_cluster_key: ubereats_cluster
+        - <<: *gold_revenue_per_restaurant_task
+          depends_on:
+            - task_key: bronze_silver_pipeline
+          job_cluster_key: ubereats_cluster
+        - <<: *gold_user_behavior_task
+          depends_on:
+            - task_key: bronze_silver_pipeline
+          job_cluster_key: ubereats_cluster
+
       classic_job_clusters: &classic_job_clusters
         - job_cluster_key: ubereats_cluster
           new_cluster:
@@ -595,86 +668,14 @@ variables:
               spark.databricks.delta.preview.enabled: "true"
               spark.databricks.delta.changeDataFeed.enabled: "true"
 
-      # All 37 tasks, classic compute — each anchor merged with job_cluster_key.
-      # Used by dev and prod (identical structure; only the `variables:` differ).
-      classic_tasks: &classic_tasks
-        - <<: *bronze_payment_events_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_gps_events_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_order_status_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_search_events_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_recommendations_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_order_items_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_orders_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_payments_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_routes_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_receipts_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_driver_shifts_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_support_tickets_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_users_mongo_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_users_mssql_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_restaurants_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_drivers_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_products_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_menu_sections_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_ratings_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_inventory_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_payment_events_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_orders_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_payments_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_drivers_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_order_items_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_driver_shifts_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_restaurants_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_order_status_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_search_events_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_recommendations_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_users_task
-          job_cluster_key: ubereats_cluster
-        - <<: *gold_payments_by_status_task
-          job_cluster_key: ubereats_cluster
-        - <<: *gold_payment_funnel_task
-          job_cluster_key: ubereats_cluster
-        - <<: *gold_payment_lifecycle_task
-          job_cluster_key: ubereats_cluster
-        - <<: *gold_driver_performance_task
-          job_cluster_key: ubereats_cluster
-        - <<: *gold_revenue_per_restaurant_task
-          job_cluster_key: ubereats_cluster
-        - <<: *gold_user_behavior_task
-          job_cluster_key: ubereats_cluster
+      # The original flat 37-task classic-compute list (classic_tasks) was removed in
+      # LAKEFLOW_MIGRATION (v1.1.0) — dev/prod use lakeflow_tasks above instead. The
+      # individual task_definitions anchors above are still needed: serverless_tasks
+      # below (free_edition) aliases the bronze_*/silver_* ones directly, and
+      # lakeflow_tasks above merges the silver_users/gold_* ones with a new depends_on.
 
-      # Same 37 tasks, serverless compute — no job_cluster_key at all. Used only by
-      # the free_edition target. Unlike classic_tasks, this is NOT a flat list of
+      # The original 37 tasks, serverless compute — no job_cluster_key at all. Used only by
+      # the free_edition target. This is NOT a flat list of
       # aliases: depends_on is overridden per task to collapse the natural 3-tier
       # fan-out (20 Bronze / 11 Silver / 6 Gold, all independent within their tier)
       # into sequential batches of <=4. Free Edition serverless can't sustain that
@@ -836,12 +837,15 @@ targets:
       landing_base: /Volumes/ubereats_dev/landing/kafka_export
       bronze_source_mode: kafka
     resources:
+      pipelines:
+        ubereats_bronze_silver:
+          <<: *bronze_silver_pipeline_resource
       jobs:
         ubereats_pipeline:
           name: ubereats_pipeline
           email_notifications: *email_notifications
           job_clusters: *classic_job_clusters
-          tasks: *classic_tasks
+          tasks: *lakeflow_tasks
 
   prod:
     mode: production
@@ -853,12 +857,15 @@ targets:
       landing_base: /Volumes/ubereats_prod/landing/kafka_export
       bronze_source_mode: kafka
     resources:
+      pipelines:
+        ubereats_bronze_silver:
+          <<: *bronze_silver_pipeline_resource
       jobs:
         ubereats_pipeline:
           name: ubereats_pipeline
           email_notifications: *email_notifications
           job_clusters: *classic_job_clusters
-          tasks: *classic_tasks
+          tasks: *lakeflow_tasks
 
   free_edition:
     mode: development
