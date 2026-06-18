@@ -873,3 +873,32 @@ unrelated to this feature)
   valid JSON, 6 cells (unchanged count, only `cell-merge` edited).
 
 ### Status: resolved (flagged for /design — duplicate user_id in silver.users not addressed at source)
+
+---
+
+## 2026-06-18 — gold_revenue_per_restaurant.ipynb — fan-out bias in avg_order_value_brl
+
+### Problems encountered
+- Lineage audit of all 6 `notebooks/cross_domain/` Gold notebooks (no Bronze reads, no
+  Bronze-Bronze joins, all 6 read Silver where Silver exists — see audit report in
+  conversation, not persisted as a separate file) surfaced a statistical bug outside
+  the audit's pass/fail criteria: in `cell-transform`, `avg(o.total_amount)` was computed
+  *after* the `order_items × orders` join. Since `order_items` is the many side of that
+  join, each order's `total_amount` was repeated once per item it contains before the
+  `groupBy("restaurant_key")` aggregation — `avg_order_value_brl` was silently weighted
+  toward restaurants with multi-item orders instead of being a true per-order average.
+  → Solution: split `cell-transform` into two restaurant-grain aggregations computed
+    independently — `orders_agg` (groupBy `restaurant_key` directly on `silver.orders`,
+    before any contact with `order_items`: `total_orders`, `avg_order_value_brl`) and
+    `items_agg` (bridges `order_items` to `orders` only to recover `restaurant_key`, then
+    groups by it: `total_items_sold`, `total_revenue_brl`, `avg_discount_brl`). The two
+    are joined to each other (1:1 on `restaurant_key`) and then to `silver.restaurants`.
+    Updated `md-title` to document the two-path aggregation and why a single post-join
+    aggregation is wrong here.
+  → Status: resolved
+
+### Verification
+- `python3 -c "import json; json.load(open('notebooks/cross_domain/gold_revenue_per_restaurant.ipynb'))"` —
+  valid JSON, 6 cells (unchanged count, `md-title` and `cell-transform` edited).
+
+### Status: resolved
