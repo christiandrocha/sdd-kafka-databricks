@@ -1,0 +1,50 @@
+# JMX exporter config for Kafka broker
+# Used by: jmx-kafka service (bitnami/jmx-exporter) → Prometheus port 9101
+# Remote JMX connection: kafka:9999
+hostPort: kafka:9999
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+
+rules:
+  - pattern: >-
+      kafka.server<type=BrokerTopicMetrics, name=(\w+), topic=(\S+)><>Count
+    name: kafka_server_brokertopicmetrics_$1_total
+    labels:
+      topic: "$2"
+
+  - pattern: >-
+      kafka.server<type=BrokerTopicMetrics, name=(\w+)><>Count
+    name: kafka_server_brokertopicmetrics_$1_total
+
+  - pattern: >-
+      kafka.server<type=ReplicaManager, name=(\w+)><>Value
+    name: kafka_server_replicamanager_$1
+
+  - pattern: >-
+      kafka.server<type=ReplicaManager, name=(\w+)><>Count
+    name: kafka_server_replicamanager_$1_total
+
+  - pattern: >-
+      kafka.controller<type=KafkaController, name=(\w+)><>Value
+    name: kafka_controller_kafkacontroller_$1
+
+  - pattern: >-
+      kafka.controller<type=ControllerStats, name=(\w+)><>Count
+    name: kafka_controller_controllerstats_$1_total
+
+  - pattern: >-
+      kafka.log<type=Log, name=(\w+), topic=(\S+), partition=([0-9]+)><>Value
+    name: kafka_log_log_$1
+    labels:
+      topic: "$2"
+      partition: "$3"
+
+  - pattern: >-
+      kafka.network<type=RequestMetrics, name=(\w+), request=(\w+)><>(\w+)
+    name: kafka_network_requestmetrics_$1_$3
+    labels:
+      request: "$2"
+
+  - pattern: >-
+      java.lang<type=Memory><HeapMemoryUsage>(\w+)
+    name: jvm_memory_heap_$1_bytes

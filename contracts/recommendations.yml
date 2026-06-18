@@ -1,0 +1,36 @@
+table:
+  name: recommendations
+  layers: [bronze, silver]
+  source: mongodb_recommendations
+  kafka_topic: pg.public.recommendations
+  merge_key: event_id
+
+schema:
+  - { name: event_id,             type: string,    nullable: false }
+  - { name: user_id,              type: integer,   nullable: false }
+  - { name: event_type,           type: string,    nullable: false }
+  - { name: product_id,           type: string,    nullable: false }
+  - { name: timestamp,            type: timestamp, nullable: false }
+  - { name: dt_current_timestamp, type: timestamp, nullable: true  }
+  - { name: __op,                 type: string,    nullable: true  }
+  - { name: __source_ts_ms,       type: long,      nullable: true  }
+  - { name: _ingested_at,         type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: event_id,             check: not_null,      on_failure: reject,     severity: critical, scope: [bronze]         }
+    - { field: user_id,              check: not_null,      on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: event_type,           check: allowed_values, values: [view, add_to_cart, purchase, click, impression], on_failure: warn, severity: warning, scope: [silver] }
+    - { field: dt_current_timestamp, check: not_future,    on_failure: warn,       severity: warning,  scope: [bronze, silver] }
+
+storage:
+  cluster_by: [event_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: true
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

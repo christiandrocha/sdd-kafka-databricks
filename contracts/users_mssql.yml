@@ -1,0 +1,40 @@
+table:
+  name: users_mssql
+  layers: [bronze, silver]
+  source: mssql_users
+  kafka_topic: pg.public.users_mssql
+  merge_key: uuid
+
+schema:
+  - { name: uuid,                 type: string,    nullable: false }
+  - { name: user_id,              type: integer,   nullable: true  }
+  - { name: cpf,                  type: string,    nullable: false }
+  - { name: first_name,           type: string,    nullable: true  }
+  - { name: last_name,            type: string,    nullable: true  }
+  - { name: phone_number,         type: string,    nullable: true  }
+  - { name: birthday,             type: date,      nullable: true  }
+  - { name: job,                  type: string,    nullable: true  }
+  - { name: company_name,         type: string,    nullable: true  }
+  - { name: country,              type: string,    nullable: true  }
+  - { name: dt_current_timestamp, type: timestamp, nullable: true  }
+  - { name: __op,                 type: string,    nullable: true  }
+  - { name: __source_ts_ms,       type: long,      nullable: true  }
+  - { name: _ingested_at,         type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: uuid,                 check: not_null,   on_failure: reject,     severity: critical, scope: [bronze]         }
+    - { field: cpf,                  check: not_null,   on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: dt_current_timestamp, check: not_future, on_failure: warn,       severity: warning,  scope: [bronze, silver] }
+
+storage:
+  cluster_by: [uuid]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: true
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

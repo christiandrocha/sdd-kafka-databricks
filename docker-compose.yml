@@ -1,0 +1,226 @@
+services:
+
+  # ──────────────────────────────────────────────────────────────
+  # SOURCE — PostgreSQL 16 with WAL logical replication for Debezium
+  # ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-payments_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=5
+      - -c
+      - max_wal_senders=5
+    volumes:
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-payments_user} -d ${POSTGRES_DB:-payments}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────────────────────
+  # KAFKA — KRaft single-node (no Zookeeper)
+  # JMX exposed on port 9999 for jmx-kafka sidecar
+  # ──────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9094
+      # Advertised port must match the HOST-mapped port (9092, see
+      # docker-compose.override.yml: "9092:9094"), not the container's
+      # internal PLAINTEXT_HOST port (9094) — clients outside Docker
+      # reconnect using whatever address/port the broker advertises here.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      # JMX — scraped by jmx-kafka sidecar (bitnami/jmx-exporter)
+      KAFKA_JMX_PORT: 9999
+      KAFKA_JMX_HOSTNAME: kafka
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ──────────────────────────────────────────────────────────────
+  # SCHEMA REGISTRY — Confluent (Avro, wire format magic byte)
+  # ──────────────────────────────────────────────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/subjects"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ──────────────────────────────────────────────────────────────
+  # KAFKA CONNECT — Debezium PostgreSQL Source
+  # Built from Dockerfile.connect (debezium-connector-postgresql)
+  # JMX exposed on port 9998 for jmx-kafka-connect sidecar
+  # ──────────────────────────────────────────────────────────────
+  kafka-connect:
+    build:
+      context: .
+      dockerfile: Dockerfile.connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:9092
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: debezium-connect
+      CONNECT_CONFIG_STORAGE_TOPIC: _debezium-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _debezium-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _debezium-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      # JMX — scraped by jmx-kafka-connect sidecar (bitnami/jmx-exporter)
+      KAFKA_JMX_PORT: 9998
+      KAFKA_JMX_HOSTNAME: kafka-connect
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ──────────────────────────────────────────────────────────────
+  # KAFKA UI — provectuslabs (topic browser + connector management)
+  # ──────────────────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+
+  # ──────────────────────────────────────────────────────────────
+  # KAFKA EXPORTER — consumer group lag (danielqsj)
+  # Scraped by Prometheus at kafka-exporter:9308
+  # ──────────────────────────────────────────────────────────────
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - --kafka.server=kafka:9092
+      - --web.listen-address=:9308
+
+  # ──────────────────────────────────────────────────────────────
+  # JMX SIDECAR — Kafka broker
+  # bitnami/jmx-exporter connects to kafka:9999, exposes metrics on :9101
+  # Prometheus target: jmx-kafka:9101 (see observability/prometheus/prometheus.yml)
+  # Bitnami pulled all versioned tags from the free `bitnami/*` repos in 2025 —
+  # `bitnamilegacy/*` is their frozen mirror of the last published versions.
+  # ──────────────────────────────────────────────────────────────
+  jmx-kafka:
+    image: bitnamilegacy/jmx-exporter:1.0.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./observability/jmx/broker-config.yml:/etc/jmx/broker-config.yml:ro
+    command: ["9101", "/etc/jmx/broker-config.yml"]
+
+  # ──────────────────────────────────────────────────────────────
+  # JMX SIDECAR — Kafka Connect / Debezium
+  # bitnami/jmx-exporter connects to kafka-connect:9998, exposes metrics on :9404
+  # Prometheus target: jmx-kafka-connect:9404 (see observability/prometheus/prometheus.yml)
+  # ──────────────────────────────────────────────────────────────
+  jmx-kafka-connect:
+    image: bitnamilegacy/jmx-exporter:1.0.1
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+    volumes:
+      - ./observability/jmx/connect-config.yml:/etc/jmx/connect-config.yml:ro
+    command: ["9404", "/etc/jmx/connect-config.yml"]
+
+  # ──────────────────────────────────────────────────────────────
+  # PROMETHEUS — scrapes kafka-jmx, kafka-exporter, kafka-connect-jmx
+  # ──────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    depends_on:
+      - jmx-kafka
+      - jmx-kafka-connect
+      - kafka-exporter
+    volumes:
+      - ./observability/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+
+  # ──────────────────────────────────────────────────────────────
+  # GRAFANA — dashboards auto-provisioned from observability/grafana/
+  # External port 3001 → internal 3000 (see docker-compose.override.yml)
+  # ──────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.2.0
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/kafka.json
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  postgres-data:
+  kafka-data:
+  prometheus-data:
+  grafana-data:

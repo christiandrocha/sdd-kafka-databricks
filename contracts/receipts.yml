@@ -1,0 +1,36 @@
+table:
+  name: receipts
+  layers: [bronze]
+  source: kafka_receipts
+  kafka_topic: pg.public.receipts
+  merge_key: receipt_id
+
+schema:
+  - { name: receipt_id,           type: string,    nullable: false }
+  - { name: order_id,             type: string,    nullable: false }
+  - { name: payment_id,           type: string,    nullable: false }
+  - { name: total_amount,         type: double,    nullable: true  }
+  - { name: item_count,           type: integer,   nullable: true  }
+  - { name: receipt_generated_at, type: timestamp, nullable: false }
+  - { name: __op,                 type: string,    nullable: true  }
+  - { name: __source_ts_ms,       type: long,      nullable: true  }
+  - { name: _ingested_at,         type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: receipt_id,          check: not_null,   on_failure: reject, severity: critical, scope: [bronze] }
+    - { field: order_id,            check: not_null,   on_failure: warn,   severity: warning,  scope: [bronze] }
+    - { field: payment_id,          check: not_null,   on_failure: warn,   severity: warning,  scope: [bronze] }
+    - { field: receipt_generated_at, check: not_future, on_failure: warn,  severity: warning,  scope: [bronze] }
+
+storage:
+  cluster_by: [receipt_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: false
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

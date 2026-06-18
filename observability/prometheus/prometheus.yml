@@ -1,0 +1,39 @@
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: local
+    project: sdd-kafka-databricks
+
+rule_files:
+  - alert_rules.yml
+
+scrape_configs:
+  # Kafka broker JMX metrics — via bitnami/jmx-exporter sidecar (jmx-kafka service)
+  # Covers: message rates, byte rates, replica lag, controller state
+  - job_name: kafka-jmx
+    static_configs:
+      - targets: ['jmx-kafka:9101']
+        labels:
+          service: kafka-broker
+
+  # Consumer group lag — via danielqsj/kafka_exporter on port 9308
+  # Covers: kafka_consumergroup_lag per (consumergroup, topic, partition)
+  - job_name: kafka-consumer-lag
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+        labels:
+          service: kafka-exporter
+
+  # Kafka Connect / Debezium JMX metrics — via bitnami/jmx-exporter sidecar (jmx-kafka-connect service)
+  # Covers: connector-task-metrics running-ratio, error counts
+  - job_name: kafka-connect-jmx
+    static_configs:
+      - targets: ['jmx-kafka-connect:9404']
+        labels:
+          service: kafka-connect
+
+  # Prometheus self-scrape
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']

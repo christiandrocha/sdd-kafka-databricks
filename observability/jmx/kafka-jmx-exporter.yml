@@ -1,0 +1,69 @@
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+
+rules:
+  # ── Broker topic metrics ────────────────────────────────────────────────────
+  # Messages in/out, bytes in/out, failed produce/fetch requests per topic
+  - pattern: >-
+      kafka.server<type=BrokerTopicMetrics, name=(\w+), topic=(\S+)><>Count
+    name: kafka_server_brokertopicmetrics_$1_total
+    labels:
+      topic: "$2"
+
+  - pattern: >-
+      kafka.server<type=BrokerTopicMetrics, name=(\w+)><>Count
+    name: kafka_server_brokertopicmetrics_$1_total
+
+  # ── Replica manager ─────────────────────────────────────────────────────────
+  # Under-replicated partitions, leader count, ISR shrinks/expands
+  - pattern: >-
+      kafka.server<type=ReplicaManager, name=(\w+)><>Value
+    name: kafka_server_replicamanager_$1
+
+  - pattern: >-
+      kafka.server<type=ReplicaManager, name=(\w+)><>Count
+    name: kafka_server_replicamanager_$1_total
+
+  # ── Controller ──────────────────────────────────────────────────────────────
+  # Active controller count (should be exactly 1), election rate
+  - pattern: >-
+      kafka.controller<type=KafkaController, name=(\w+)><>Value
+    name: kafka_controller_kafkacontroller_$1
+
+  - pattern: >-
+      kafka.controller<type=ControllerStats, name=(\w+)><>Count
+    name: kafka_controller_controllerstats_$1_total
+
+  # ── Log metrics ─────────────────────────────────────────────────────────────
+  # Partition size, log end offset, log start offset per topic+partition
+  - pattern: >-
+      kafka.log<type=Log, name=(\w+), topic=(\S+), partition=([0-9]+)><>Value
+    name: kafka_log_log_$1
+    labels:
+      topic: "$2"
+      partition: "$3"
+
+  # ── Network request metrics ──────────────────────────────────────────────────
+  # Total time, local time, request queue time per request type
+  - pattern: >-
+      kafka.network<type=RequestMetrics, name=(\w+), request=(\w+)><>(\w+)
+    name: kafka_network_requestmetrics_$1_$3
+    labels:
+      request: "$2"
+
+  # ── Purgatory (delayed operations) ──────────────────────────────────────────
+  - pattern: >-
+      kafka.server<type=DelayedOperationPurgatory, name=(\w+), delayedOperation=(\w+)><>Value
+    name: kafka_server_delayedoperationpurgatory_$1
+    labels:
+      operation: "$2"
+
+  # ── ZooKeeper / KRaft session ────────────────────────────────────────────────
+  - pattern: >-
+      kafka.server<type=SessionExpireListener, name=(\w+)><>Count
+    name: kafka_server_sessionexpirelistener_$1_total
+
+  # ── JVM heap (useful baseline) ───────────────────────────────────────────────
+  - pattern: >-
+      java.lang<type=Memory><HeapMemoryUsage>(\w+)
+    name: jvm_memory_heap_$1_bytes

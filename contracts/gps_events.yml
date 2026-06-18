@@ -1,0 +1,42 @@
+table:
+  name: gps_events
+  layers: [bronze]
+  source: kafka_gps
+  kafka_topic: pg.public.gps_events
+  merge_key: gps_id
+
+schema:
+  - { name: gps_id,               type: string,    nullable: false }
+  - { name: order_id,             type: string,    nullable: false }
+  - { name: lat,                  type: double,    nullable: false }
+  - { name: lon,                  type: double,    nullable: false }
+  - { name: altitude,             type: double,    nullable: true  }
+  - { name: speed_kph,            type: double,    nullable: true  }
+  - { name: accuracy_m,           type: double,    nullable: true  }
+  - { name: direction_deg,        type: double,    nullable: true  }
+  - { name: duration_ms,          type: double,    nullable: true  }
+  - { name: timestamp,            type: timestamp, nullable: false }
+  - { name: dt_current_timestamp, type: timestamp, nullable: true  }
+  - { name: __op,                 type: string,    nullable: true  }
+  - { name: __source_ts_ms,       type: long,      nullable: true  }
+  - { name: _ingested_at,         type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: gps_id,               check: not_null,   on_failure: reject, severity: critical, scope: [bronze] }
+    - { field: order_id,             check: not_null,   on_failure: warn,   severity: warning,  scope: [bronze] }
+    - { field: lat,                  check: not_null,   on_failure: warn,   severity: warning,  scope: [bronze] }
+    - { field: lon,                  check: not_null,   on_failure: warn,   severity: warning,  scope: [bronze] }
+    - { field: dt_current_timestamp, check: not_future, on_failure: warn,   severity: warning,  scope: [bronze] }
+
+storage:
+  cluster_by: [gps_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: false
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

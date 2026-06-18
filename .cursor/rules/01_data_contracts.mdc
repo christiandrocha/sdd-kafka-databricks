@@ -1,0 +1,100 @@
+---
+description: "Regras para geração e uso de contratos YAML de dados"
+globs: ["contracts/**", "notebooks/**", "tests/test_contracts.py"]
+alwaysApply: false
+---
+
+# Contratos de Dados — Regras de Uso
+
+## Os contratos YAML são a source of truth
+
+Todo schema, quality rule, Delta property e merge_key estão em `contracts/`.
+**Nunca hardcode essas informações no código.**
+
+## Estrutura obrigatória de cada contrato
+
+```yaml
+table:
+  name: {table_name}
+  layer: bronze | silver | gold
+  merge_key: {pk_field}       # obrigatório para Silver e Gold
+
+schema:
+  - name: {field}
+    type: string | bigint | integer | boolean | timestamp | binary
+    nullable: true | false     # sempre bool Python, nunca string
+
+quality:
+  quarantine_table: ubereats_{env}.quarantine.{table_name}
+  rules:
+    - field: {field}
+      check: not_null | allowed_values | not_future | unique
+      values: [...]             # obrigatório para allowed_values
+      on_failure: quarantine | reject | drop
+      severity: critical | warning
+      scope: [silver] | [silver, gold]
+
+storage:
+  format: delta
+  compression: snappy | zstd
+  cluster_by: [{col1}, {col2}]  # DEVE conter merge_key (ADR-04)
+  properties:
+    delta.enableChangeDataFeed: true | false
+    delta.autoOptimize.optimizeWrite: true
+    delta.autoOptimize.autoCompact: true | false
+    delta.logRetentionDuration: "interval 7 days" | "interval 30 days"
+
+schema_evolution:
+  new_fields: ignore | fail
+  removed_fields: nullable | fail
+  type_changes: quarantine | fail
+```
+
+## Regra crítica — cluster_by DEVE conter merge_key
+
+```python
+# test_contracts.py valida isso automaticamente
+# Se violar, o MERGE INTO fará full table scan (ADR-04)
+assert merge_key in cluster_by
+```
+
+## Como usar nos notebooks
+
+```python
+# CORRETO — ler do contrato
+from contracts.loader import load_contract
+from contracts.spark_schema import get_struct_type, get_delta_properties
+
+contract = load_contract(contract_path)
+schema = get_struct_type(contract)
+
+# ERRADO — nunca hardcode
+schema = StructType([StructField("event_id", StringType(), False)])
+```
+
+## Tipos YAML → Spark
+
+| YAML | PySpark | Notas |
+|---|---|---|
+| `string` | `StringType()` | |
+| `bigint` ou `long` | `LongType()` | timestamps em ms |
+| `integer` | `IntegerType()` | |
+| `boolean` | `BooleanType()` | nullable no YAML deve ser bool, não string |
+| `timestamp` | `TimestampType()` | UTC — não NTZ |
+| `binary` | `BinaryType()` | envelope Debezium bruto |
+
+## TBLPROPERTIES — serialização correta
+
+```python
+# bool Python → lowercase string (não 'True'/'False')
+str(True).lower()   # → 'true'  ✅
+str(True)           # → 'True'  ❌ Delta não reconhece
+
+# int → string com aspas no SQL
+# 'delta.dataSkippingNumIndexedCols' = '2'  ✅
+# delta.dataSkippingNumIndexedCols = 2      ❌ ParseException
+
+# Chaves com ponto → sempre entre aspas simples no SQL
+# 'delta.enableChangeDataFeed' = 'true'     ✅
+# delta.enableChangeDataFeed = 'true'       ❌ ParseException
+```

@@ -1,0 +1,34 @@
+table:
+  name: inventory
+  layers: [bronze]
+  source: postgres_inventory
+  kafka_topic: pg.public.inventory
+  merge_key: stock_id
+
+schema:
+  - { name: stock_id,           type: string,    nullable: false }
+  - { name: restaurant_id,      type: integer,   nullable: false }
+  - { name: product_id,         type: string,    nullable: false }
+  - { name: quantity_available, type: integer,   nullable: true  }
+  - { name: last_updated,       type: timestamp, nullable: false }
+  - { name: __op,               type: string,    nullable: true  }
+  - { name: __source_ts_ms,     type: long,      nullable: true  }
+  - { name: _ingested_at,       type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: stock_id,     check: not_null,   on_failure: reject, severity: critical, scope: [bronze] }
+    - { field: product_id,   check: not_null,   on_failure: warn,   severity: warning,  scope: [bronze] }
+    - { field: last_updated, check: not_future, on_failure: warn,   severity: warning,  scope: [bronze] }
+
+storage:
+  cluster_by: [stock_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: false
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

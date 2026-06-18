@@ -1,0 +1,45 @@
+table:
+  name: products
+  layers: [bronze]
+  source: mysql_products
+  kafka_topic: pg.public.products
+  merge_key: product_id
+
+schema:
+  - { name: product_id,           type: string,    nullable: false }
+  - { name: restaurant_id,        type: integer,   nullable: false }
+  - { name: name,                 type: string,    nullable: true  }
+  - { name: product_type,         type: string,    nullable: true  }
+  - { name: cuisine_type,         type: string,    nullable: true  }
+  - { name: flavor_profile,       type: string,    nullable: true  }
+  - { name: tags,                 type: string,    nullable: true  }
+  - { name: price,                type: double,    nullable: true  }
+  - { name: unit_cost,            type: double,    nullable: true  }
+  - { name: calories,             type: integer,   nullable: true  }
+  - { name: prep_time_min,        type: integer,   nullable: true  }
+  - { name: is_vegetarian,        type: boolean,   nullable: true  }
+  - { name: is_gluten_free,       type: boolean,   nullable: true  }
+  - { name: created_at,           type: timestamp, nullable: true  }
+  - { name: updated_at,           type: timestamp, nullable: true  }
+  - { name: dt_current_timestamp, type: timestamp, nullable: true  }
+  - { name: __op,                 type: string,    nullable: true  }
+  - { name: __source_ts_ms,       type: long,      nullable: true  }
+  - { name: _ingested_at,         type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: product_id,           check: not_null,   on_failure: reject, severity: critical, scope: [bronze] }
+    - { field: restaurant_id,        check: not_null,   on_failure: warn,   severity: warning,  scope: [bronze] }
+    - { field: dt_current_timestamp, check: not_future, on_failure: warn,   severity: warning,  scope: [bronze] }
+
+storage:
+  cluster_by: [product_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: false
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

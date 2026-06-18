@@ -1,0 +1,47 @@
+table:
+  name: driver_shifts
+  layers: [bronze, silver]
+  source: kafka_shift
+  kafka_topic: pg.public.driver_shifts
+  merge_key: shift_id
+
+schema:
+  - { name: shift_id,             type: string,    nullable: false }
+  - { name: driver_id,            type: string,    nullable: false }
+  - { name: shift_type,           type: string,    nullable: true  }
+  - { name: login_method,         type: string,    nullable: true  }
+  - { name: device_os,            type: string,    nullable: true  }
+  - { name: start_time,           type: timestamp, nullable: true  }
+  - { name: end_time,             type: timestamp, nullable: true  }
+  - { name: shift_duration_min,   type: integer,   nullable: true  }
+  - { name: num_orders,           type: integer,   nullable: true  }
+  - { name: earnings_brl,         type: double,    nullable: true  }
+  - { name: distance_covered_km,  type: double,    nullable: true  }
+  - { name: shift_rating,         type: double,    nullable: true  }
+  - { name: issues_reported,      type: string,    nullable: true  }
+  - { name: city,                 type: string,    nullable: true  }
+  - { name: region,               type: string,    nullable: true  }
+  - { name: available,            type: boolean,   nullable: true  }
+  - { name: dt_current_timestamp, type: timestamp, nullable: true  }
+  - { name: __op,                 type: string,    nullable: true  }
+  - { name: __source_ts_ms,       type: long,      nullable: true  }
+  - { name: _ingested_at,         type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: shift_id,             check: not_null,      on_failure: reject,     severity: critical, scope: [bronze]         }
+    - { field: driver_id,            check: not_null,      on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: shift_type,           check: allowed_values, values: [Morning, Afternoon, Evening, Overnight], on_failure: warn, severity: warning, scope: [silver] }
+    - { field: dt_current_timestamp, check: not_future,    on_failure: warn,       severity: warning,  scope: [bronze, silver] }
+
+storage:
+  cluster_by: [shift_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: true
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

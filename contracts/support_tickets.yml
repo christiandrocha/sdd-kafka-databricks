@@ -1,0 +1,37 @@
+table:
+  name: support_tickets
+  layers: [bronze]
+  source: mongodb_support
+  kafka_topic: pg.public.support_tickets
+  merge_key: ticket_id
+
+schema:
+  - { name: ticket_id,            type: string,    nullable: false }
+  - { name: user_id,              type: integer,   nullable: false }
+  - { name: order_id,             type: string,    nullable: true  }
+  - { name: category,             type: string,    nullable: true  }
+  - { name: description,          type: string,    nullable: true  }
+  - { name: status,               type: string,    nullable: true  }
+  - { name: opened_at,            type: timestamp, nullable: false }
+  - { name: dt_current_timestamp, type: timestamp, nullable: true  }
+  - { name: __op,                 type: string,    nullable: true  }
+  - { name: __source_ts_ms,       type: long,      nullable: true  }
+  - { name: _ingested_at,         type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: ticket_id,            check: not_null,   on_failure: reject, severity: critical, scope: [bronze] }
+    - { field: user_id,              check: not_null,   on_failure: warn,   severity: warning,  scope: [bronze] }
+    - { field: dt_current_timestamp, check: not_future, on_failure: warn,   severity: warning,  scope: [bronze] }
+
+storage:
+  cluster_by: [ticket_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: false
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

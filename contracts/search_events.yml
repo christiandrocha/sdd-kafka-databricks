@@ -1,0 +1,36 @@
+table:
+  name: search_events
+  layers: [bronze, silver]
+  source: kafka_search
+  kafka_topic: pg.public.search_events
+  merge_key: search_id
+
+schema:
+  - { name: search_id,          type: string,    nullable: false }
+  - { name: user_id,            type: integer,   nullable: false }
+  - { name: query_text,         type: string,    nullable: true  }
+  - { name: filters,            type: string,    nullable: true  }
+  - { name: result_count,       type: integer,   nullable: true  }
+  - { name: clicked_product_id, type: string,    nullable: true  }
+  - { name: timestamp,          type: timestamp, nullable: false }
+  - { name: __op,               type: string,    nullable: true  }
+  - { name: __source_ts_ms,     type: long,      nullable: true  }
+  - { name: _ingested_at,       type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: search_id, check: not_null,   on_failure: reject,     severity: critical, scope: [bronze]         }
+    - { field: user_id,   check: not_null,   on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: timestamp, check: not_future, on_failure: warn,       severity: warning,  scope: [bronze, silver] }
+
+storage:
+  cluster_by: [search_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: true
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

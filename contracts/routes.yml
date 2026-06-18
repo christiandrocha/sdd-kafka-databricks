@@ -1,0 +1,42 @@
+table:
+  name: routes
+  layers: [bronze]
+  source: kafka_route
+  kafka_topic: pg.public.routes
+  merge_key: route_id
+
+schema:
+  - { name: route_id,              type: string,    nullable: false }
+  - { name: order_id,              type: string,    nullable: false }
+  - { name: driver_id,             type: string,    nullable: false }
+  - { name: start_lat,             type: double,    nullable: true  }
+  - { name: start_lon,             type: double,    nullable: true  }
+  - { name: end_lat,               type: double,    nullable: true  }
+  - { name: end_lon,               type: double,    nullable: true  }
+  - { name: distance_km,           type: double,    nullable: true  }
+  - { name: estimated_duration_min, type: double,   nullable: true  }
+  - { name: start_time,            type: timestamp, nullable: true  }
+  - { name: end_time,              type: timestamp, nullable: true  }
+  - { name: dt_current_timestamp,  type: timestamp, nullable: true  }
+  - { name: __op,                  type: string,    nullable: true  }
+  - { name: __source_ts_ms,        type: long,      nullable: true  }
+  - { name: _ingested_at,          type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: route_id,             check: not_null,   on_failure: reject, severity: critical, scope: [bronze] }
+    - { field: order_id,             check: not_null,   on_failure: warn,   severity: warning,  scope: [bronze] }
+    - { field: driver_id,            check: not_null,   on_failure: warn,   severity: warning,  scope: [bronze] }
+    - { field: dt_current_timestamp, check: not_future, on_failure: warn,   severity: warning,  scope: [bronze] }
+
+storage:
+  cluster_by: [route_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: false
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

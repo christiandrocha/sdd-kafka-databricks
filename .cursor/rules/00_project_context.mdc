@@ -1,0 +1,63 @@
+---
+description: "Contexto do projeto sdd-kafka-databricks e workflow SDD obrigatório"
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# sdd-kafka-databricks — Contexto e Workflow SDD
+
+## Leitura obrigatória antes de qualquer ação
+
+Antes de gerar, editar ou analisar qualquer arquivo neste projeto, leia:
+
+1. `CLAUDE.md` — contexto completo, domain map, decisões críticas
+2. `.claude/03_design.md` — ADRs e manifesto de arquitetura
+3. O contrato YAML relevante em `contracts/` (se existir para o domínio)
+
+## Workflow SDD obrigatório
+
+Este projeto usa **Spec Driven Development (AgentSpec)**. A sequência é:
+
+```
+Brainstorm → Define → Design → Build → Ship
+```
+
+**Nunca pule fases.** Se o usuário pedir para gerar código diretamente, pergunte:
+"Qual fase do SDD estamos? Brainstorm, Define, Design, Build ou Ship?"
+
+Os documentos de cada fase ficam em `.claude/sdd/features/`.
+
+## Decisões arquiteturais críticas (não violar)
+
+| Decisão | Regra |
+|---|---|
+| Bronze | Append-only. Recebe flat records pós-SMT com `__op` e `__source_ts_ms` |
+| Silver | MERGE INTO com Liquid Clustering. `cluster_by` = `merge_key` (ADR-04) |
+| Notebooks | 2 parametrizados (`pipeline_bronze` + `pipeline_silver`) via DABs — nunca 60 estáticos |
+| Contratos | Source of truth para schema, quality rules e Delta properties |
+| Unity Catalog | `ubereats_dev/prod` → `bronze/silver/gold/quarantine` |
+| Schema Registry | Confluent (não Apicurio) |
+| Topologia | Unidirecional — `load_to_postgres.py` popula PostgreSQL |
+
+## Agentes especializados disponíveis
+
+Os agentes estão em `.claude/agents/`. Para tarefas específicas, use:
+
+- **Brainstorm/Define/Design:** `.claude/agents/workflow/`
+- **PySpark + Streaming:** `.claude/agents/data-engineering/spark-specialist.md`
+- **Medallion Architecture:** `.claude/agents/architect/medallion-architect.md`
+- **Contratos de dados:** `.claude/agents/test/data-contracts-engineer.md`
+- **Databricks + DABs:** `.claude/agents/architect/data-platform-engineer.md`
+- **CI/CD:** `.claude/agents/cloud/ci-cd-specialist.md`
+
+## Referência de domínios (20 tabelas)
+
+Ver `CLAUDE.md` seção "Domain map". Os 8 domínios Bronze-only (sem Silver):
+`gps_events, routes, receipts, support_tickets, products, menu_sections, ratings, inventory`
+
+## Atualização obrigatória após cada sessão de build
+
+Após qualquer sessão de build:
+- Atualizar `.claude/05_implementation_log.md` com o que foi feito
+- Registrar divergências do manifesto
+- Registrar problemas encontrados e soluções

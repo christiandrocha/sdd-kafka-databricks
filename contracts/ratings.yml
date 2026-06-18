@@ -1,0 +1,36 @@
+table:
+  name: ratings
+  layers: [bronze]
+  source: mysql_ratings
+  kafka_topic: pg.public.ratings
+  merge_key: uuid
+
+schema:
+  - { name: uuid,                  type: string,    nullable: false }
+  - { name: rating_id,             type: integer,   nullable: false }
+  - { name: restaurant_identifier, type: string,    nullable: false }
+  - { name: rating,                type: double,    nullable: false }
+  - { name: timestamp,             type: timestamp, nullable: false }
+  - { name: dt_current_timestamp,  type: timestamp, nullable: true  }
+  - { name: __op,                  type: string,    nullable: true  }
+  - { name: __source_ts_ms,        type: long,      nullable: true  }
+  - { name: _ingested_at,          type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: uuid,                 check: not_null,      on_failure: reject, severity: critical, scope: [bronze] }
+    - { field: rating_id,            check: not_null,      on_failure: warn,   severity: warning,  scope: [bronze] }
+    - { field: rating,               check: allowed_values, values: [1, 2, 3, 4, 5], on_failure: warn, severity: warning, scope: [bronze] }
+    - { field: dt_current_timestamp, check: not_future,    on_failure: warn,   severity: warning,  scope: [bronze] }
+
+storage:
+  cluster_by: [uuid]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: false
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

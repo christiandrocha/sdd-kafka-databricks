@@ -1,0 +1,34 @@
+table:
+  name: payment_events
+  layers: [bronze, silver]
+  source: kafka_events
+  kafka_topic: pg.public.payment_events
+  merge_key: event_id
+
+schema:
+  - { name: event_id,             type: string,    nullable: false }
+  - { name: payment_id,           type: string,    nullable: false }
+  - { name: event,                type: string,    nullable: true  }
+  - { name: dt_current_timestamp, type: timestamp, nullable: true  }
+  - { name: __op,                 type: string,    nullable: true  }
+  - { name: __source_ts_ms,       type: long,      nullable: true  }
+  - { name: _ingested_at,         type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: event_id,             check: not_null,   on_failure: reject,     severity: critical, scope: [bronze]         }
+    - { field: payment_id,           check: not_null,   on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: event,                check: not_null,   on_failure: warn,       severity: warning,  scope: [silver]         }
+    - { field: dt_current_timestamp, check: not_future, on_failure: warn,       severity: warning,  scope: [bronze, silver] }
+
+storage:
+  cluster_by: [event_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: true
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

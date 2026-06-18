@@ -1,0 +1,46 @@
+table:
+  name: order_items
+  layers: [bronze, silver]
+  source: mongodb_items
+  kafka_topic: pg.public.order_items
+  merge_key: order_item_id
+
+schema:
+  - { name: order_item_id,      type: string,    nullable: false }
+  - { name: order_id,           type: string,    nullable: false }
+  - { name: product_id,         type: string,    nullable: false }
+  - { name: product_name,       type: string,    nullable: true  }
+  - { name: product_type,       type: string,    nullable: true  }
+  - { name: cuisine_type,       type: string,    nullable: true  }
+  - { name: restaurant_id,      type: integer,   nullable: false }
+  - { name: quantity,           type: integer,   nullable: true  }
+  - { name: unit_price,         type: double,    nullable: true  }
+  - { name: discount_applied,   type: double,    nullable: true  }
+  - { name: subtotal,           type: double,    nullable: true  }
+  - { name: is_combo,           type: boolean,   nullable: true  }
+  - { name: is_vegetarian,      type: boolean,   nullable: true  }
+  - { name: modifiers,          type: string,    nullable: true  }
+  - { name: dt_current_timestamp, type: timestamp, nullable: true  }
+  - { name: __op,               type: string,    nullable: true  }
+  - { name: __source_ts_ms,     type: long,      nullable: true  }
+  - { name: _ingested_at,       type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: order_item_id,        check: not_null,   on_failure: reject,     severity: critical, scope: [bronze]         }
+    - { field: order_id,             check: not_null,   on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: product_id,           check: not_null,   on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: unit_price,           check: not_null,   on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: dt_current_timestamp, check: not_future, on_failure: warn,       severity: warning,  scope: [bronze, silver] }
+
+storage:
+  cluster_by: [order_item_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: true
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

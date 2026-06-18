@@ -1,0 +1,119 @@
+---
+description: "Padrões para notebooks PySpark parametrizados via DABs"
+globs: ["notebooks/**/*.ipynb", "databricks.yml"]
+alwaysApply: false
+---
+
+# Notebooks PySpark — Regras e Padrões
+
+## Princípio fundamental: 2 notebooks, não 60
+
+`pipeline_bronze.ipynb` e `pipeline_silver.ipynb` são parametrizados.
+DABs os executa 20x e 12x com parâmetros distintos por domínio.
+**Nunca criar um notebook estático por domínio** — isso viola DRY (ADR-03).
+
+## Widgets obrigatórios — pipeline_bronze.ipynb
+
+```python
+dbutils.widgets.text("table_name",          "payment_events")
+dbutils.widgets.text("kafka_topic",         "pg.public.payment_events")
+dbutils.widgets.text("kafka_bootstrap",     "localhost:9092")
+dbutils.widgets.text("schema_registry_url", "http://localhost:8081")
+dbutils.widgets.text("bronze_table",        "ubereats_dev.bronze.payment_events")
+dbutils.widgets.text("checkpoint_path",     "/Volumes/ubereats_dev/checkpoints/bronze/payment_events")
+dbutils.widgets.text("max_offsets",         "1000")
+dbutils.widgets.text("starting_offsets",    "earliest")
+dbutils.widgets.text("contract_path",       "contracts/payment_events.yml")
+```
+
+## Widgets obrigatórios — pipeline_silver.ipynb
+
+```python
+dbutils.widgets.text("table_name",       "payment_events")
+dbutils.widgets.text("bronze_table",     "ubereats_dev.bronze.payment_events")
+dbutils.widgets.text("silver_table",     "ubereats_dev.silver.payment_events")
+dbutils.widgets.text("quarantine_table", "ubereats_dev.quarantine.payment_events")
+dbutils.widgets.text("contract_path",    "contracts/payment_events.yml")
+dbutils.widgets.text("checkpoint_path",  "/Volumes/ubereats_dev/checkpoints/silver/payment_events")
+```
+
+## Padrão Bronze — leitura e escrita
+
+```python
+# Leitura do Kafka
+df = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", kafka_bootstrap) \
+    .option("subscribe", kafka_topic) \
+    .option("startingOffsets", starting_offsets) \
+    .option("maxOffsetsPerTrigger", int(max_offsets)) \
+    .load()
+
+# Parse Avro com Schema Registry
+from pyspark.sql.functions import from_avro
+parsed = df.select(
+    from_avro(col("value"),
+              options={"schemaRegistryAddress": schema_registry_url}
+             ).alias("data"),
+    col("offset").alias("_kafka_offset"),
+    col("timestamp").alias("_kafka_timestamp")
+)
+
+# Escrita append-only
+parsed.writeStream \
+    .format("delta") \
+    .outputMode("append") \
+    .option("checkpointLocation", checkpoint_path) \
+    .trigger(availableNow=True) \
+    .toTable(bronze_table)
+```
+
+## Padrão Silver — MERGE INTO
+
+```python
+def merge_to_silver(df_batch, batch_id):
+    df_batch = df_batch.withColumn("_processed_at", current_timestamp())
+    df_batch.createOrReplaceTempView("staging_silver")
+    spark.sql(f"""
+        MERGE INTO {silver_table} AS target
+        USING staging_silver AS source
+        ON target.{merge_key} = source.{merge_key}
+        WHEN MATCHED AND source.__source_ts_ms > target.__source_ts_ms
+            THEN UPDATE SET *
+        WHEN NOT MATCHED
+            THEN INSERT *
+    """)
+
+df.writeStream \
+    .foreachBatch(merge_to_silver) \
+    .option("checkpointLocation", checkpoint_path) \
+    .trigger(availableNow=True) \
+    .start()
+```
+
+## Campos especiais do Debezium (pós-SMT)
+
+Os registros chegam flat com dois campos adicionados pelo SMT:
+- `__op` — tipo de operação: `c` (insert), `u` (update), `r` (snapshot), `d` (delete)
+- `__source_ts_ms` — timestamp do evento no PostgreSQL em milissegundos
+
+## JSONB fields — payment_events e order_status
+
+```python
+from pyspark.sql.functions import get_json_object
+
+# payment_events.event é JSONB → chega como string
+df = df.withColumn("event_name",
+    get_json_object(col("data.event"), "$.event_name"))
+df = df.withColumn("event_ts",
+    get_json_object(col("data.event"), "$.timestamp").cast("long"))
+```
+
+## Regras anti-pattern
+
+| Nunca fazer | Por quê | Em vez disso |
+|---|---|---|
+| Ler Bronze em notebooks Gold | Viola lineage Medallion | Sempre ler Silver |
+| Hardcodar catalog name | Quebra dev/prod parity | Widget + DABs variable |
+| `trigger(continuous=True)` | Cluster sempre ligado | `trigger(availableNow=True)` |
+| cluster_by ≠ merge_key | Full table scan no MERGE | Alinhar (ADR-04) |

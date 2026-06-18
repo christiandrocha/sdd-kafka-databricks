@@ -1,0 +1,10 @@
+FROM confluentinc/cp-kafka-connect:7.7.1
+
+USER root
+
+# Debezium PostgreSQL Source connector (CDC from PostgreSQL → Kafka)
+# 2.7.1.Final was never published to Confluent Hub (it jumps 2.5.4 -> 3.0.8) —
+# 2.5.4 is the latest 2.x release actually available there.
+RUN confluent-hub install --no-prompt debezium/debezium-connector-postgresql:2.5.4
+
+USER appuser

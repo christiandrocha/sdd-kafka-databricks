@@ -1,0 +1,39 @@
+---
+description: "sdd-kafka-databricks — Regras principais do projeto"
+alwaysApply: true
+---
+
+# sdd-kafka-databricks
+
+Projeto de pipeline CDC streaming para Uber Eats Brasil.
+20 domínios, 4 fontes, PostgreSQL → Debezium → Kafka → Databricks.
+
+## Leia sempre antes de agir
+
+1. `CLAUDE.md` — contexto completo e domain map
+2. `.claude/03_design.md` — ADRs e manifesto
+3. `.claude/04_build.delegation.md` — delegação por agente
+
+## Workflow SDD (sempre respeitar)
+
+```
+Brainstorm → Define → Design → Build → Ship
+```
+
+Documentos ativos em `.claude/sdd/features/`.
+Nunca pule fases. Nunca gere código sem spec.
+
+## Decisões críticas (nunca violar)
+
+- **Bronze**: flat records pós-SMT com `__op` e `__source_ts_ms` — append-only
+- **Silver**: MERGE INTO com `cluster_by` = `merge_key` (ADR-04 — obrigatório)
+- **Notebooks**: 2 parametrizados via DABs — nunca 60 estáticos (ADR-03)
+- **Contratos**: YAML em `contracts/` é source of truth — nunca hardcode schema
+- **Unity Catalog**: `ubereats_dev/prod` → `bronze/silver/gold/quarantine`
+- **Topology**: Unidirecional — `load_to_postgres.py` popula PostgreSQL
+
+## Rules específicas disponíveis
+
+- `01_data_contracts.mdc` — contratos YAML, tipos, TBLPROPERTIES
+- `02_notebooks.mdc` — PySpark parametrizado, widgets, MERGE INTO
+- `03_testing.mdc` — test_contracts.py obrigatório

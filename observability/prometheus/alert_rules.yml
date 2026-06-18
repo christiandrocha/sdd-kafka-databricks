@@ -1,0 +1,66 @@
+groups:
+  - name: kafka
+    interval: 30s
+    rules:
+
+      # Consumer group is falling behind on a topic — likely a slow or stuck consumer
+      - alert: KafkaConsumerLagHigh
+        expr: kafka_consumergroup_lag{topic!~"__.*"} > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Consumer lag high on {{ $labels.topic }}"
+          description: >
+            Consumer group {{ $labels.consumergroup }} is {{ $value | humanize }}
+            messages behind on topic {{ $labels.topic }} partition {{ $labels.partition }}.
+            Investigate consumer throughput or Databricks job run status.
+
+      # Consumer lag is critically high — pipeline is severely behind
+      - alert: KafkaConsumerLagCritical
+        expr: sum by (topic) (kafka_consumergroup_lag{topic!~"__.*"}) > 10000
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical consumer lag on {{ $labels.topic }}"
+          description: >
+            Total lag across all partitions for topic {{ $labels.topic }} is {{ $value | humanize }}.
+            Bronze ingestion may be stalled.
+
+      # A Debezium connector task is not in RUNNING state
+      - alert: ConnectorTaskFailed
+        expr: kafka_connect_connector_task_metrics_running_ratio{connector!=""} < 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Debezium connector task not running: {{ $labels.connector }}"
+          description: >
+            Connector {{ $labels.connector }} task {{ $labels.task }} has running-ratio
+            {{ $value }} (expected 1.0). CDC from PostgreSQL may be interrupted.
+            Check: curl http://localhost:8083/connectors/{{ $labels.connector }}/status
+
+      # No brokers are reachable — entire Kafka cluster is down
+      - alert: BrokerDown
+        expr: kafka_brokers < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka broker(s) down"
+          description: >
+            kafka_brokers reports {{ $value }} active broker(s).
+            All CDC ingestion is stopped. Check docker-compose logs kafka.
+
+      # Under-replicated partitions indicate replica lag or broker failure
+      - alert: UnderReplicatedPartitions
+        expr: kafka_server_replicamanager_underreplicatedpartitions > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Under-replicated partitions detected"
+          description: >
+            {{ $value }} partition(s) are under-replicated.
+            This may cause message loss if the leader goes down.

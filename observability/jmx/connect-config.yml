@@ -1,0 +1,39 @@
+# JMX exporter config for Kafka Connect (Debezium)
+# Used by: jmx-kafka-connect service (bitnami/jmx-exporter) → Prometheus port 9404
+# Remote JMX connection: kafka-connect:9998
+hostPort: kafka-connect:9998
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+
+rules:
+  - pattern: >-
+      kafka.connect<type=connector-task-metrics, connector=(\S+), task=([0-9]+)><>running-ratio
+    name: kafka_connect_connector_task_metrics_running_ratio
+    labels:
+      connector: "$1"
+      task: "$2"
+
+  - pattern: >-
+      kafka.connect<type=connector-task-metrics, connector=(\S+), task=([0-9]+)><>total-errors-logged
+    name: kafka_connect_connector_task_metrics_total_errors_logged_total
+    labels:
+      connector: "$1"
+      task: "$2"
+
+  - pattern: >-
+      kafka.connect<type=connector-metrics, connector=(\S+)><>connector-running-tasks
+    name: kafka_connect_connector_metrics_connector_running_tasks
+    labels:
+      connector: "$1"
+
+  - pattern: >-
+      kafka.connect<type=connect-worker-metrics><>(\w+)
+    name: kafka_connect_worker_metrics_$1
+
+  - pattern: >-
+      kafka.connect<type=connect-coordinator-metrics><>(\w+)
+    name: kafka_connect_coordinator_metrics_$1
+
+  - pattern: >-
+      java.lang<type=Memory><HeapMemoryUsage>(\w+)
+    name: jvm_connect_memory_heap_$1_bytes

@@ -1,0 +1,35 @@
+table:
+  name: menu_sections
+  layers: [bronze]
+  source: mysql_menu
+  kafka_topic: pg.public.menu_sections
+  merge_key: menu_section_id
+
+schema:
+  - { name: menu_section_id,      type: string,    nullable: false }
+  - { name: restaurant_id,        type: integer,   nullable: false }
+  - { name: name,                 type: string,    nullable: false }
+  - { name: description,          type: string,    nullable: true  }
+  - { name: active,               type: boolean,   nullable: true  }
+  - { name: dt_current_timestamp, type: timestamp, nullable: true  }
+  - { name: __op,                 type: string,    nullable: true  }
+  - { name: __source_ts_ms,       type: long,      nullable: true  }
+  - { name: _ingested_at,         type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: menu_section_id,      check: not_null,   on_failure: reject, severity: critical, scope: [bronze] }
+    - { field: restaurant_id,        check: not_null,   on_failure: warn,   severity: warning,  scope: [bronze] }
+    - { field: dt_current_timestamp, check: not_future, on_failure: warn,   severity: warning,  scope: [bronze] }
+
+storage:
+  cluster_by: [menu_section_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: false
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

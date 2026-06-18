@@ -1,0 +1,32 @@
+# Local dev port bindings — maps container ports to localhost
+# These are not included in docker-compose.yml to keep the base config portable.
+# docker-compose automatically merges this file when running `docker-compose up`.
+
+services:
+  postgres:
+    ports:
+      - "5432:5432"      # postgresql://payments_user:...@localhost:5432/payments
+
+  kafka:
+    ports:
+      - "9092:9094"      # PLAINTEXT_HOST listener (host:9092 → container PLAINTEXT_HOST:9094)
+
+  schema-registry:
+    ports:
+      - "8081:8081"      # http://localhost:8081
+
+  kafka-connect:
+    ports:
+      - "8083:8083"      # http://localhost:8083/connectors
+
+  kafka-ui:
+    ports:
+      - "8080:8080"      # http://localhost:8080
+
+  prometheus:
+    ports:
+      - "9090:9090"      # http://localhost:9090
+
+  grafana:
+    ports:
+      - "3001:3000"      # http://localhost:3001 (admin/admin)

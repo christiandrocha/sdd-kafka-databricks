@@ -1,0 +1,61 @@
+table:
+  name: payments
+  layers: [bronze, silver]
+  source: kafka_payments
+  kafka_topic: pg.public.payments
+  merge_key: payment_id
+
+schema:
+  - { name: payment_id,         type: string,    nullable: false }
+  - { name: order_key,          type: string,    nullable: false }
+  - { name: status,             type: string,    nullable: false }
+  - { name: method,             type: string,    nullable: true  }
+  - { name: provider,           type: string,    nullable: true  }
+  - { name: amount,             type: double,    nullable: true  }
+  - { name: net_amount,         type: double,    nullable: true  }
+  - { name: platform_fee,       type: double,    nullable: true  }
+  - { name: provider_fee,       type: double,    nullable: true  }
+  - { name: tax_amount,         type: double,    nullable: true  }
+  - { name: refund_amount,      type: double,    nullable: true  }
+  - { name: currency,           type: string,    nullable: true  }
+  - { name: captured,           type: boolean,   nullable: true  }
+  - { name: refunded,           type: boolean,   nullable: true  }
+  - { name: card_brand,         type: string,    nullable: true  }
+  - { name: card_last4,         type: string,    nullable: true  }
+  - { name: card_exp_month,     type: integer,   nullable: true  }
+  - { name: card_exp_year,      type: integer,   nullable: true  }
+  - { name: invoice_id,         type: string,    nullable: true  }
+  - { name: receipt_url,        type: string,    nullable: true  }
+  - { name: wallet_provider,    type: string,    nullable: true  }
+  - { name: failure_reason,     type: string,    nullable: true  }
+  - { name: country,            type: string,    nullable: true  }
+  - { name: ip_address,         type: string,    nullable: true  }
+  - { name: user_agent,         type: string,    nullable: true  }
+  - { name: timestamp,          type: timestamp, nullable: true  }
+  - { name: capture_timestamp,  type: timestamp, nullable: true  }
+  - { name: dt_current_timestamp, type: timestamp, nullable: true  }
+  - { name: __op,               type: string,    nullable: true  }
+  - { name: __source_ts_ms,     type: long,      nullable: true  }
+  - { name: _ingested_at,       type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: payment_id,           check: not_null,      on_failure: reject,     severity: critical, scope: [bronze]         }
+    - { field: order_key,            check: not_null,      on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: status,               check: not_null,      on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: status,               check: allowed_values, values: [succeeded, failed, pending, refunded, cancelled], on_failure: warn, severity: warning, scope: [silver] }
+    - { field: amount,               check: not_null,      on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: currency,             check: allowed_values, values: [BRL],         on_failure: warn,   severity: warning,  scope: [silver]         }
+    - { field: dt_current_timestamp, check: not_future,    on_failure: warn,       severity: warning,  scope: [bronze, silver] }
+
+storage:
+  cluster_by: [payment_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: true
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden

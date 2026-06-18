@@ -1,0 +1,79 @@
+---
+description: "Regras para testes e qualidade de código"
+globs: ["tests/**", "contracts/loader.py", "contracts/spark_schema.py"]
+alwaysApply: false
+---
+
+# Testes e Qualidade — Regras
+
+## test_contracts.py — validações obrigatórias
+
+O arquivo `tests/test_contracts.py` deve validar:
+
+```python
+# 1. Todos os YAMLs são sintaticamente válidos
+def test_all_contracts_valid_yaml():
+    for yml in Path("contracts").glob("*.yml"):
+        data = yaml.safe_load(yml.read_text())
+        assert data is not None
+
+# 2. Quality rules referenciam campos existentes no schema
+def test_quality_rules_reference_existing_fields():
+    for yml in Path("contracts").glob("*.yml"):
+        contract = yaml.safe_load(yml.read_text())
+        schema_fields = {f["name"] for f in contract.get("schema", [])}
+        for rule in contract.get("quality", {}).get("rules", []):
+            assert rule["field"] in schema_fields
+
+# 3. allowed_values são listas não vazias
+def test_allowed_values_non_empty():
+    for yml in Path("contracts").glob("*.yml"):
+        contract = yaml.safe_load(yml.read_text())
+        for rule in contract.get("quality", {}).get("rules", []):
+            if rule.get("check") == "allowed_values":
+                assert isinstance(rule.get("values"), list)
+                assert len(rule["values"]) > 0
+
+# 4. cluster_by contém merge_key (ADR-04)
+def test_cluster_by_aligns_with_merge_key():
+    for yml in Path("contracts").glob("*.yml"):
+        contract = yaml.safe_load(yml.read_text())
+        merge_key = contract.get("table", {}).get("merge_key")
+        cluster_by = contract.get("storage", {}).get("cluster_by", [])
+        if merge_key and cluster_by:
+            assert merge_key in cluster_by, \
+                f"{yml.name}: merge_key '{merge_key}' not in cluster_by {cluster_by}"
+
+# 5. nullable é sempre bool Python (nunca string)
+def test_nullable_is_bool():
+    for yml in Path("contracts").glob("*.yml"):
+        contract = yaml.safe_load(yml.read_text())
+        for field in contract.get("schema", []):
+            if "nullable" in field:
+                assert isinstance(field["nullable"], bool), \
+                    f"{yml.name}: campo '{field['name']}' tem nullable como string"
+```
+
+## loader.py — responsabilidades
+
+`contracts/loader.py` deve:
+- Ler e validar YAMLs (sem deps externas — só PyYAML)
+- Retornar dict Python com o contrato parseado
+- Levantar erro claro se YAML inválido ou campo obrigatório ausente
+- **Não importar PySpark** — é usado também em tests locais
+
+## spark_schema.py — responsabilidades
+
+`contracts/spark_schema.py` deve:
+- Importar de `contracts.loader`
+- Gerar `StructType` a partir do contrato
+- Gerar string SQL de TBLPROPERTIES
+- Gerar cláusula `CLUSTER BY`
+- **Nunca importar PySpark no nível do módulo** — usar import lazy para evitar erro fora do Databricks
+
+## Cobertura mínima
+
+| Módulo | Cobertura mínima |
+|---|---|
+| `contracts/` | 100% (source of truth) |
+| `tests/test_contracts.py` | auto-validado |

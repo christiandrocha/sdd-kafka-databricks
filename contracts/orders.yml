@@ -1,0 +1,40 @@
+table:
+  name: orders
+  layers: [bronze, silver]
+  source: kafka_orders
+  kafka_topic: pg.public.orders
+  merge_key: order_id
+
+schema:
+  - { name: order_id,             type: string,    nullable: false }
+  - { name: user_key,             type: string,    nullable: false }
+  - { name: restaurant_key,       type: string,    nullable: false }
+  - { name: driver_key,           type: string,    nullable: true  }
+  - { name: payment_key,          type: string,    nullable: true  }
+  - { name: rating_key,           type: string,    nullable: true  }
+  - { name: order_date,           type: timestamp, nullable: true  }
+  - { name: total_amount,         type: double,    nullable: true  }
+  - { name: dt_current_timestamp, type: timestamp, nullable: true  }
+  - { name: __op,                 type: string,    nullable: true  }
+  - { name: __source_ts_ms,       type: long,      nullable: true  }
+  - { name: _ingested_at,         type: timestamp, nullable: false }
+
+quality:
+  rules:
+    - { field: order_id,             check: not_null,   on_failure: reject,     severity: critical, scope: [bronze]         }
+    - { field: user_key,             check: not_null,   on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: restaurant_key,       check: not_null,   on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: total_amount,         check: not_null,   on_failure: quarantine, severity: critical, scope: [silver]         }
+    - { field: dt_current_timestamp, check: not_future, on_failure: warn,       severity: warning,  scope: [bronze, silver] }
+
+storage:
+  cluster_by: [order_id]
+  compression: zstd
+  properties:
+    delta.enableChangeDataFeed: true
+    delta.autoOptimize.optimizeWrite: true
+
+schema_evolution:
+  new_fields: allowed
+  removed_fields: forbidden
+  type_changes: forbidden
