@@ -844,3 +844,32 @@ unrelated to this feature)
   auth login` to get a clean confirmation.
 
 ### Status: resolved (pending fresh CLI auth for full remote validation)
+
+---
+
+## 2026-06-18 — gold_user_behavior.ipynb — DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE
+
+### Problems encountered
+- `cell-merge`'s `MERGE INTO {gold_table}` failed with
+  `DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE`: the `gold_user_behavior_batch`
+  source view had more than one row per `user_id`. Root cause is upstream of this
+  notebook — `pipeline_users.ipynb` dedupes/merges `silver.users` by `cpf_key`, not by
+  `user_id`, so `silver.users` can still carry duplicate `user_id` values. `cell-transform`'s
+  `LEFT JOIN` of the (unique-on-`user_id`) `search_agg`/`rec_agg` full-outer result against
+  `users.select("user_id", "cpf", "city", "country")` fans out one row per duplicate match,
+  breaking the gold table's one-row-per-`user_id` grain right before the `MERGE`.
+  → Solution: in `cell-merge`, added a `Window.partitionBy("user_id").orderBy(desc("_computed_at"))`
+    + `row_number()` dedup (same pattern as `dedup_by_cpf` in `pipeline_users.ipynb`) producing
+    `behavior_df_deduped`, and pointed `createOrReplaceTempView` at the deduped frame instead of
+    `behavior_df`. Used `_computed_at` (the column actually present on this gold frame) rather than
+    `_ingested_at` as the freshness tiebreaker.
+  → Status: resolved — workaround, not a root-cause fix; the real duplicate-`user_id` rows still
+    exist in `silver.users` and will silently pick an arbitrary "freshest" survivor here. Flagging
+    for `/design` review: consider deduping `users.select(...)` by `user_id` in `cell-transform`
+    instead/also, or enforcing `user_id` uniqueness in `pipeline_users.ipynb`.
+
+### Verification
+- `python3 -c "import json; json.load(open('notebooks/cross_domain/gold_user_behavior.ipynb'))"` —
+  valid JSON, 6 cells (unchanged count, only `cell-merge` edited).
+
+### Status: resolved (flagged for /design — duplicate user_id in silver.users not addressed at source)
