@@ -802,3 +802,45 @@ unrelated to this feature)
   present, confirming `classic_tasks`/dev/prod were not touched.
 
 ### Status: resolved
+
+---
+
+## 2026-06-18 — pipeline_users.ipynb — missing-cpf users silently dropped, not quarantined
+
+### Problems encountered
+- `dedup_by_cpf` (see prior entry on EXPLODING_JOIN, which was already fixed)
+  partitions by `cpf_key`, and Spark's window partitioning groups all `NULL`s into
+  one partition — so rows with no CPF on either `users_mongo` or `users_mssql`
+  collapsed to a single arbitrary survivor per side instead of being preserved.
+  Those rows then never matched anything in the `full_outer` join's `cpf_key`
+  predicate (`NULL == NULL` is not true in Spark SQL semantics) and were silently
+  lost — no error, no record in any table.
+  → Solution: added a `quarantine_table` widget (default
+    `ubereats_dev.quarantine.users`, no contract exists for `users` so the DDL is
+    hand-rolled in cell `cell-create-table`, mirroring `silver.users`'s shape plus
+    `_quarantine_reason`/`_quarantine_ts`). In `cell-read-bronze`, split each raw
+    bronze frame on `cpf_key IS NULL` *before* `dedup_by_cpf` runs: the null-cpf
+    side is projected into the quarantine shape via `to_quarantine_shape()` (per
+    source, since `users_mongo` and `users_mssql` have disjoint column sets),
+    unioned, tagged `_quarantine_reason="missing_cpf"`, and appended to
+    `quarantine_table`. Only the cpf-present side continues into `dedup_by_cpf` →
+    the existing `full_outer` join → Silver write. Also added
+    `quarantine_table: ${var.catalog}.quarantine.users` to the `silver_users` task's
+    `base_parameters` in `databricks.yml` — without it, the job would always
+    default to `ubereats_dev.quarantine.users` regardless of target/catalog.
+  → Status: resolved
+
+### Verification
+- `python3 -c "import json; json.load(open('notebooks/pipeline_users.ipynb'))"` —
+  notebook is valid JSON, 7 cells (unchanged count, cells edited in place).
+- `databricks bundle validate -t dev -o json`, parsed `silver_users` task
+  `base_parameters`: now includes `quarantine_table: ${var.catalog}.quarantine.users`
+  alongside the existing three params.
+- Full `databricks bundle validate` (text mode, all 3 targets) currently blocked
+  in this environment by an expired OAuth refresh token (`error getting token:
+  token refresh ... Refresh token is invalid`), unrelated to this change — flagged
+  to the user; `-o json` calls still rendered correctly despite the same warning
+  on stderr. Re-run `databricks bundle validate -t <target>` after `databricks
+  auth login` to get a clean confirmation.
+
+### Status: resolved (pending fresh CLI auth for full remote validation)

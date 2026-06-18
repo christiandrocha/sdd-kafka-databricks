@@ -519,6 +519,7 @@ variables:
               bronze_users_mongo: ${var.catalog}.bronze.users_mongo
               bronze_users_mssql: ${var.catalog}.bronze.users_mssql
               silver_users_table: ${var.catalog}.silver.users
+              quarantine_table: ${var.catalog}.quarantine.users
 
         gold_payments_by_status: &gold_payments_by_status_task
           task_key: gold_payments_by_status
