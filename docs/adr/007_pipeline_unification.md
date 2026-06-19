@@ -143,6 +143,43 @@ and should not be treated as load-bearing until `prod` actually runs against Kaf
 infrastructure — deploying `prod` before then would need `bronze_source_mode: volume`
 overridden at deploy time.
 
+## Addendum 2 (2026-06-19) — `register_bronze()` decorator fix and quarantine→silver cycle fix
+
+Two defects surfaced once the unified pipeline was checked against the real Lakeflow DAG
+validator, both fixed in `pipelines/ubereats_pipeline.py` without reopening Decisions 2/3:
+
+**Bronze decorator for `source_mode=volume`:** `register_bronze()` decorated every Bronze
+table with `@dp.table(...)` regardless of mode, on the assumption (Decision 2's rationale)
+that a `@dp.table` function can return either a streaming or a static DataFrame and have
+Lakeflow infer the table type from the body. In practice the static (`spark.read`) path used
+by `volume` mode needs the explicit `@dp.materialized_view(...)` decorator — `@dp.table`
+without it is reserved for the `spark.readStream` (`kafka` mode) path. Fixed by selecting the
+decorator per-domain at registration time: `dp.materialized_view if SOURCE_MODE == "volume"
+else dp.table`. This affects `dev`/`free_edition` (both `volume`) for all 20 Bronze tables;
+`prod` (`kafka`) is unaffected.
+
+**Quarantine→Silver cycle for `check: unique` domains:** `_unique_violations()` (Decision 3)
+read `spark.read.table(silver_table)` — the *target* Silver table — from inside the
+quarantine table's body, to compare the current candidate batch against already-persisted
+Silver state. But `silver_table` is itself populated from `clean_view`, which reads from
+`quarantine_table` (left-anti join) — so for any domain using `check: unique`
+(`restaurants.cnpj`, `drivers.driver_id`; see `docs/adr/005_gold_dimension_join_integrity.md`),
+this created `quarantine → silver_table → clean_view → quarantine`, a cycle in the DLT DAG.
+Fixed by confining the uniqueness check entirely to the candidate batch: `_unique_violations()`
+no longer takes a `silver_table` argument or reads any persisted table — it flags any `field`
+value that maps to more than one distinct `merge_key` within the current candidate set via a
+self-join (`groupBy(field).agg(countDistinct(merge_key))`). This preserves the inverse-predicate
+quarantine convention (Silver and Quarantine both read only from `<domain>_silver_candidate`;
+neither reads a same-level table) at the cost of not catching a duplicate that arrives in a
+later run after its first occurrence already settled into Silver — accepted as defense-in-depth
+already exists downstream (the `row_number()` guards in `register_gold_driver_performance()`/
+`register_gold_revenue_per_restaurant()`).
+
+Both fixes verified with `ruff check` (no new findings) and the existing 196-test suite
+(`pytest tests/test_contracts.py tests/test_dlt_adapter.py`), which has no live-workspace
+DAG-cycle check — the cycle itself was only observable via the real Lakeflow pipeline graph,
+not unit tests.
+
 ## See also
 
 `.claude/sdd/features/DESIGN_PIPELINE_UNIFICATION.md` — full design, file manifest, and code

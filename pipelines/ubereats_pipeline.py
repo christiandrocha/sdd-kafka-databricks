@@ -79,21 +79,24 @@ def _avro_schema_str(kafka_topic: str) -> str:
     return resp.json()["schema"]
 
 
-def _unique_violations(candidate_df, fields, merge_key, silver_table):
-    """Stream-static join — porta _unique_violation_values() de pipeline_silver.ipynb para
-    uma transformacao declarativa. O lado estatico (spark.read.table) e' reavaliado a cada
-    disparo de microbatch pelo motor Spark Structured Streaming."""
+def _unique_violations(candidate_df, fields, merge_key):
+    """Self-join confinado a' candidate_df — porta _unique_violation_values() de
+    pipeline_silver.ipynb para uma transformacao declarativa. A versao original lia
+    spark.read.table(silver_table) (o lado estatico), mas isso faz quarantine depender
+    do proprio silver_table que ela alimenta via clean_view -> create_auto_cdc_flow,
+    formando um ciclo no DAG do DLT (restaurants e drivers, os dois dominios com regra
+    check: unique). O anti-join agora compara apenas dentro do batch corrente: qualquer
+    valor de `field` que aponte para mais de um `merge_key` distinto e' violacao."""
     bad = candidate_df.sparkSession.createDataFrame([], candidate_df.schema).limit(0)
     for field in fields:
-        existing = spark.read.table(silver_table).select(field, merge_key).distinct()
-        cross_batch = (
-            candidate_df.select(field, merge_key).distinct().alias("i")
-            .join(existing.alias("e"), field)
-            .filter(col(f"i.{merge_key}") != col(f"e.{merge_key}"))
+        dup_values = (
+            candidate_df.select(field, merge_key).distinct()
+            .groupBy(field)
+            .agg(countDistinct(merge_key).alias("_distinct_keys"))
+            .filter(col("_distinct_keys") > 1)
+            .select(field)
         )
-        bad = bad.unionByName(
-            candidate_df.join(cross_batch.select(field).distinct(), field, "left_semi")
-        )
+        bad = bad.unionByName(candidate_df.join(dup_values, field, "left_semi"))
     return bad.distinct()
 
 
@@ -104,7 +107,12 @@ def register_bronze(contract: dict) -> str:
     bronze_table = f"{CATALOG}.bronze.{domain}"
     max_offsets = MAX_OFFSETS_OVERRIDES.get(domain, DEFAULT_MAX_OFFSETS)
 
-    @dp.table(name=bronze_table, cluster_by=cluster_by, comment=f"Bronze: {domain}")
+    # source_mode=volume reads with spark.read (batch, full recompute every run) — DLT
+    # requires @dp.materialized_view() for that shape. @dp.table() is reserved for the
+    # spark.readStream path (source_mode=kafka), where the engine tracks incremental state.
+    bronze_decorator = dp.materialized_view if SOURCE_MODE == "volume" else dp.table
+
+    @bronze_decorator(name=bronze_table, cluster_by=cluster_by, comment=f"Bronze: {domain}")
     @dp.expect_all_or_drop(to_reject_expectations(contract, scope="bronze"))
     def _bronze():
         if SOURCE_MODE == "kafka":
@@ -160,7 +168,7 @@ def register_silver(contract: dict, bronze_table: str) -> None:
         candidate = dp.read_stream(candidate_view)
         rowlevel_bad = candidate.filter(row_predicate) if row_predicate else candidate.limit(0)
         unique_bad = (
-            _unique_violations(candidate, unique_fields, merge_key, silver_table)
+            _unique_violations(candidate, unique_fields, merge_key)
             if unique_fields else candidate.limit(0)
         )
         return rowlevel_bad.unionByName(unique_bad).distinct()

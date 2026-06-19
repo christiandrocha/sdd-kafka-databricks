@@ -1147,3 +1147,54 @@ JOIN; guard `row_number()` retrofitado nos 2 Gold que ainda não tinham.
   Deploy de `prod` antes dessa verificação precisaria sobrescrever para `volume` manualmente.
 
 ### Status: resolved
+
+---
+
+## 2026-06-19 — pipelines/ubereats_pipeline.py — decorator de Bronze para source_mode=volume e ciclo quarantine↔silver no DAG do DLT
+
+### Implemented
+- `register_bronze()` — decorator agora escolhido por modo: `dp.materialized_view` quando
+  `SOURCE_MODE == "volume"` (`dev`/`free_edition`), `dp.table` quando `kafka` (`prod`). A
+  suposição original (DESIGN_PIPELINE_UNIFICATION.md Decision 2) de que `@dp.table` infere o
+  tipo de tabela a partir do corpo da função (streaming vs. estático) não se sustenta para o
+  validador real do Lakeflow — o caminho `spark.read` (batch) exige `@dp.materialized_view`
+  explícito.
+- `_unique_violations()` — removido o parâmetro `silver_table` e a leitura
+  `spark.read.table(silver_table)`. A checagem de unicidade agora compara apenas dentro do
+  próprio `candidate_df` (self-join via `groupBy(field).agg(countDistinct(merge_key))`),
+  eliminando a dependência quarantine → silver_table que formava um ciclo
+  `quarantine → silver_table → clean_view → quarantine` no DAG do DLT.
+- `docs/adr/007_pipeline_unification.md` — novo "Addendum 2 (2026-06-19)" documentando os
+  dois fixes e o trade-off aceito (uniqueness check não detecta mais duplicata entre runs
+  diferentes, só dentro do batch corrente — mitigado pelos guards `row_number()` já existentes
+  em `register_gold_driver_performance()`/`register_gold_revenue_per_restaurant()`).
+
+### Decisions made during build
+- O ciclo do DAG foi verificado em **dois** domínios, não só `restaurants`: `contracts/
+  drivers.yml` e `contracts/restaurants.yml` são os únicos dois contratos com regra
+  `check: unique` em `scope: [silver]` (confirmado via grep nos YAMLs) — `driver_id` e `cnpj`
+  respectivamente. Ambos tinham o mesmo ciclo; o fix em `_unique_violations()` corrige os dois
+  de uma vez, já que a função é compartilhada por todo o loop de `register_silver()`.
+- Mantido o padrão "Silver e Quarantine leem da mesma view upstream, nenhuma tabela lê de
+  outra do mesmo nível" — a única violação desse padrão no arquivo era a leitura estática de
+  `silver_table` dentro de `_unique_violations()`; nenhum outro domínio/tabela faz leitura
+  cross-level equivalente.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py` → sem erros de sintaxe.
+- `ruff check pipelines/ubereats_pipeline.py` → 11 findings, todos pré-existentes (`F821
+  Undefined name 'spark'` — `spark` é injetado em runtime pelo Lakeflow, não importado; mesma
+  contagem antes/depois do fix, exceto uma queda de 12→11 pela remoção do parâmetro
+  `silver_table` não utilizado fora do novo corpo da função).
+- `PYTHONPATH=. pytest tests/test_contracts.py tests/test_dlt_adapter.py -q` → 196 passed,
+  0 regressões.
+- Validação do DAG em si (ausência de ciclo) só é observável contra um workspace Lakeflow
+  real — não há teste unitário que reproduza a validação de grafo do DLT.
+
+### Open questions
+- Nenhuma — os dois fixes foram aplicados, verificados estaticamente, e o deploy/run fica
+  para a etapa seguinte deste build.
+
+### Status: resolved
+
+### Status: resolved
