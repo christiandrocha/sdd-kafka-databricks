@@ -12,9 +12,9 @@
 # Users + 6 Gold) — Lakeflow serverless support there hasn't been verified, so it keeps
 # running pipeline_bronze.ipynb/pipeline_silver.ipynb (source_mode=volume).
 #
-# Compute: dev/prod use a classic job cluster (job_cluster_key) for the 7 remaining
-# notebook tasks — the Lakeflow pipeline manages its own compute separately; free_edition
-# uses serverless (no job_clusters at all — Free Edition doesn't support custom compute).
+# Compute: the real workspace behind dev/prod/free_edition is a Free Edition account,
+# which only supports serverless compute — no job_clusters/job_cluster_key anywhere in
+# this file. For notebook_task, serverless is just the absence of a cluster config.
 # DABs has no way to exclude a root-level resource from a single target
 # (https://github.com/databricks/cli/issues/2872), so each job/pipeline lives entirely
 # inside its target's own `resources:` block. The task_definitions anchors (still 37 —
@@ -628,52 +628,36 @@ variables:
       # tasks from classic_tasks. silver_users and the 6 gold_* keep their own notebook
       # tasks, with depends_on pointed at bronze_silver_pipeline instead of the individual
       # bronze_*/silver_* task_keys that no longer exist in this target's job.
+      # No job_cluster_key on any of these — the real workspace behind dev/prod/
+      # free_edition only supports serverless compute, same as serverless_tasks below.
+      # For notebook_task (all 7 of these), serverless is simply the absence of a
+      # cluster config (job_cluster_key/existing_cluster_id/new_cluster) — no
+      # environment_key/environments block needed, that's for non-notebook task types.
       lakeflow_tasks: &lakeflow_tasks
         - *bronze_silver_pipeline_task
 
         - <<: *silver_users_task
           depends_on:
             - task_key: bronze_silver_pipeline
-          job_cluster_key: ubereats_cluster
 
         - <<: *gold_payments_by_status_task
           depends_on:
             - task_key: bronze_silver_pipeline
-          job_cluster_key: ubereats_cluster
         - <<: *gold_payment_funnel_task
           depends_on:
             - task_key: bronze_silver_pipeline
-          job_cluster_key: ubereats_cluster
         - <<: *gold_payment_lifecycle_task
           depends_on:
             - task_key: bronze_silver_pipeline
-          job_cluster_key: ubereats_cluster
         - <<: *gold_driver_performance_task
           depends_on:
             - task_key: bronze_silver_pipeline
-          job_cluster_key: ubereats_cluster
         - <<: *gold_revenue_per_restaurant_task
           depends_on:
             - task_key: bronze_silver_pipeline
-          job_cluster_key: ubereats_cluster
         - <<: *gold_user_behavior_task
           depends_on:
             - task_key: bronze_silver_pipeline
-          job_cluster_key: ubereats_cluster
-
-      classic_job_clusters: &classic_job_clusters
-        - job_cluster_key: ubereats_cluster
-          new_cluster:
-            spark_version: 15.4.x-scala2.12
-            # node_type_id: Standard_DS3_v2    # Azure
-            # node_type_id: m5.xlarge          # AWS
-            # node_type_id: n1-standard-4      # GCP
-            node_type_id: Standard_DS3_v2
-            num_workers: 2
-            data_security_mode: SINGLE_USER
-            spark_conf:
-              spark.databricks.delta.preview.enabled: "true"
-              spark.databricks.delta.changeDataFeed.enabled: "true"
 
       # The original flat 37-task classic-compute list (classic_tasks) was removed in
       # LAKEFLOW_MIGRATION (v1.1.0) — dev/prod use lakeflow_tasks above instead. The
@@ -851,7 +835,7 @@ targets:
         ubereats_pipeline:
           name: ubereats_pipeline
           email_notifications: *email_notifications
-          job_clusters: *classic_job_clusters
+          # No job_clusters — workspace only supports serverless, same as free_edition.
           tasks: *lakeflow_tasks
 
   prod:
@@ -871,7 +855,7 @@ targets:
         ubereats_pipeline:
           name: ubereats_pipeline
           email_notifications: *email_notifications
-          job_clusters: *classic_job_clusters
+          # No job_clusters — workspace only supports serverless, same as free_edition.
           tasks: *lakeflow_tasks
 
   free_edition:
