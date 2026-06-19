@@ -15,10 +15,12 @@
 #
 # Targets differ only by `variables:` (catalog, bronze_source_mode, landing_base) — not by
 # code or resource shape. bronze_source_mode picks the branch pipelines/ubereats_pipeline.py's
-# register_bronze() takes: "kafka" (spark.readStream, dev/prod default) or "volume"
-# (spark.read batch off the landing Volume, free_edition default) — see
-# notebooks/pipeline_bronze.ipynb's original source_mode split before this migration retired
-# it, and ADR-05 (free_edition's Kafka-reachability premise) as cited above.
+# register_bronze() takes: "volume" (spark.read batch off the landing Volume — the correct,
+# permanent mode for dev/free_edition in this project, not a temporary workaround: Databricks
+# serverless compute cannot reach the self-hosted Kafka broker from either target) or "kafka"
+# (spark.readStream — prod's target mode, once Kafka runs on infrastructure Databricks can
+# actually reach; not yet the case, so prod uses it as a documented future state, not current
+# behavior). See docs/adr/007_pipeline_unification.md for the decision record.
 #
 # Compute: the real workspace behind dev/prod/free_edition is a Free Edition account, which
 # only supports serverless compute — no job_clusters/job_cluster_key anywhere in this file.
@@ -90,8 +92,8 @@ variables:
     description: Base path for the Kafka export Volume (Bronze source_mode=volume)
     default: /Volumes/ubereats_dev/landing/kafka_export
   bronze_source_mode:
-    description: "kafka (streaming, default) or volume (batch, Free Edition)"
-    default: kafka
+    description: "volume (batch off the landing Volume — correct/permanent for dev and free_edition) or kafka (streaming — prod's target mode once Kafka is reachable from Databricks)"
+    default: volume
   kafka_bootstrap:
     description: Kafka bootstrap servers
     default: localhost:9092
@@ -106,7 +108,10 @@ targets:
     variables:
       catalog: ubereats_dev
       landing_base: /Volumes/ubereats_dev/landing/kafka_export
-      bronze_source_mode: kafka
+      # volume is permanent here, not a placeholder — dev runs on the same Databricks
+      # serverless compute as free_edition, which cannot reach the self-hosted Kafka
+      # broker. Populate the landing Volume first with scripts/export_kafka_to_volume.py.
+      bronze_source_mode: volume
     resources:
       pipelines:
         ubereats_pipeline:
@@ -126,6 +131,10 @@ targets:
     variables:
       catalog: ubereats_prod
       landing_base: /Volumes/ubereats_prod/landing/kafka_export
+      # kafka is prod's target mode, not its current verified state — it documents
+      # where prod is headed once Kafka runs on infrastructure Databricks can reach,
+      # not a confirmed-working deployment today. dev/free_edition use volume because
+      # that constraint is real for both right now.
       bronze_source_mode: kafka
     resources:
       pipelines:
@@ -144,6 +153,8 @@ targets:
     variables:
       catalog: ubereats_dev
       landing_base: /Volumes/ubereats_dev/landing/kafka_export
+      # Already correct, same reasoning as dev above — both run on Databricks
+      # serverless compute that cannot reach the self-hosted Kafka broker.
       bronze_source_mode: volume
     resources:
       pipelines:
@@ -156,6 +167,7 @@ targets:
           email_notifications: *email_notifications
           # No job_clusters — Free Edition only supports serverless compute. The 37-task
           # notebook job (PIPELINE_UNIFICATION's predecessor) is retired — this target now
-          # runs the same single pipeline_task as dev/prod, with bronze_source_mode=volume.
+          # runs the same single pipeline_task as dev/prod, with bronze_source_mode=volume
+          # (same as dev — only prod targets kafka, and only once that mode is verified).
           tasks:
             - *pipeline_task

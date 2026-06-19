@@ -1106,3 +1106,44 @@ JOIN; guard `row_number()` retrofitado nos 2 Gold que ainda não tinham.
   Recommendations).
 
 ### Status: resolved
+
+---
+
+## 2026-06-19 — databricks.yml — volume é o modo permanente de dev/free_edition, não workaround temporário
+
+### Implemented
+- `databricks.yml` — `dev.bronze_source_mode` mudou de `kafka` para `volume` (permanente);
+  `prod.bronze_source_mode` permanece `kafka`, agora documentado explicitamente como modo
+  futuro/alvo, não estado atual confirmado; `free_edition.bronze_source_mode` permanece
+  `volume` (já correto). Default global da variável `bronze_source_mode` também mudou de
+  `kafka` para `volume`. Comentários do header e de cada target reescritos para refletir
+  que `volume` é o modo correto do projeto para `dev`/`free_edition`, não um contorno.
+- `docs/adr/007_pipeline_unification.md` — novo "Addendum (2026-06-19)" documentando a
+  decisão explicitamente: por que `volume` é permanente para `dev`/`free_edition` e por que
+  `kafka` em `prod` é aspiracional, não verificado.
+- `CLAUDE.md` — seção "Bronze has two source_modes" e o diagrama de estrutura do Unity
+  Catalog atualizados para a mesma framing (volume = padrão dev/free_edition; kafka =
+  alvo futuro só de prod).
+
+### Decisions made during build
+- O addendum foi adicionado dentro do `docs/adr/007_pipeline_unification.md` existente
+  (não um ADR-008 novo) — é um refinamento da mesma decisão de `source_mode` que o ADR-007
+  já cobre (a pergunta "qual modo é correto por target" estava deliberadamente aberta ali),
+  não a reversão de uma decisão já assentada. Convenção de ADR append-only deste projeto
+  preservada via seção datada separada, não reescrevendo o corpo original do ADR-007.
+
+### Verification
+- `yaml.safe_load(databricks.yml)` → `dev`/`free_edition` = `volume`, `prod` = `kafka`.
+- `databricks bundle validate --target {dev,prod,free_edition}` → mesma limitação de
+  ambiente já registrada (token OAuth expirado), resolve YAML/anchors corretamente antes de
+  falhar na autenticação.
+- `ruff check .` → All checks passed.
+- `PYTHONPATH=. pytest tests/test_contracts.py tests/test_dlt_adapter.py -q` → 196 passed,
+  0 regressões.
+
+### Open questions
+- `prod.bronze_source_mode: kafka` continua não verificado contra uma infraestrutura Kafka
+  de fato alcançável por `prod` — é um estado-alvo documentado, não uma configuração testada.
+  Deploy de `prod` antes dessa verificação precisaria sobrescrever para `volume` manualmente.
+
+### Status: resolved

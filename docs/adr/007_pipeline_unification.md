@@ -107,9 +107,41 @@ also disappear — Lakeflow infers those dependencies automatically from each Go
 Rationale). The `source_mode=volume` branch for Bronze and the live Kafka-reachability
 question for `free_edition`/`dev`/`prod` remain unverified against a real workspace as of this
 ADR — see `.claude/sdd/reports/BUILD_REPORT_PIPELINE_UNIFICATION.md` for what was and wasn't
-validated. `scripts/preflight_unity_catalog.sh`'s `checkpoints` schema/Volumes
-(`bronze`/`silver`) become unused infrastructure once `free_edition` stops running the
-checkpointed legacy notebooks — left in place as a follow-up cleanup, not addressed here.
+validated. (Addendum below resolves this for `dev`/`free_edition`; `prod` remains open.)
+`scripts/preflight_unity_catalog.sh`'s `checkpoints` schema/Volumes (`bronze`/`silver`)
+become unused infrastructure once `free_edition` stops running the checkpointed legacy
+notebooks — left in place as a follow-up cleanup, not addressed here.
+
+## Addendum (2026-06-19) — `bronze_source_mode` is a permanent per-target decision, not a temporary workaround
+
+When this ADR was first accepted, `dev`'s `bronze_source_mode` was left at `kafka` pending
+verification — sharing the same open Kafka-reachability question as `free_edition`. That
+question is now resolved as a deliberate, permanent per-target policy rather than left open:
+
+**Decision:** `dev` and `free_edition` set `bronze_source_mode: volume` permanently — not as
+a stopgap until Kafka reachability is confirmed, but as the project's correct mode for both,
+because both run on the same Databricks workspace/serverless compute that cannot reach the
+self-hosted Kafka broker. `prod` keeps `bronze_source_mode: kafka`, but as a documented
+*target* mode, not a confirmed-working one — it reflects where `prod` is headed once Kafka
+runs on infrastructure Databricks can actually reach (e.g. a managed/cloud-hosted broker, or
+network peering into the self-hosted one), not where `prod` stands today.
+`databricks.yml`'s comments were updated to stop describing `volume` as `free_edition`'s
+special case and `kafka` as the dev/prod default — it's the reverse: `volume` is the shared
+default for `dev`/`free_edition`, and `kafka` is `prod`-only and aspirational.
+
+**Rationale:** `register_bronze()`'s `source_mode` branch was always designed to support both
+modes (`DESIGN_PIPELINE_UNIFICATION.md` Decision 2) specifically because this project's real
+Databricks workspace cannot reach a self-hosted Kafka broker from serverless compute — that
+constraint was never `free_edition`-specific, since `dev` runs on the exact same workspace.
+`prod` is the one target where the constraint isn't assumed to hold forever, since `prod` is
+expected to eventually run against different, Kafka-reachable infrastructure.
+
+**Consequences:** this resolves DEFINE's Assumption A-001 for `dev`/`free_edition` — it is no
+longer "unverified," it is "volume by design," independent of whether Kafka happens to be
+reachable from either target's compute. `prod`'s `kafka` setting remains genuinely unverified
+and should not be treated as load-bearing until `prod` actually runs against Kafka-reachable
+infrastructure — deploying `prod` before then would need `bronze_source_mode: volume`
+overridden at deploy time.
 
 ## See also
 

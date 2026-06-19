@@ -69,21 +69,24 @@ as `dev`/`prod`. All 8 legacy notebooks are retired. See
 The goal is validating correctness of MERGE idempotency, Data Contracts,
 and Liquid Clustering alignment — not demonstrating Petabyte throughput.
 
-**Bronze has two source_modes — kafka (default) and volume (Free Edition)**
-Databricks Free Edition's serverless compute may not reach a self-hosted
-Kafka broker (outbound network is restricted to a fixed allowlist, not
-customizable outside the Enterprise tier) — unverified as of v1.2.0, design
-supports both outcomes. `pipelines/ubereats_pipeline.py`'s `register_bronze()`
-reads a pipeline-level `ubereats.source_mode` configuration value: `kafka`
-(default, `spark.readStream`, used by `dev`/`prod`) or `volume` (`spark.read`
-batch off `/Volumes/<catalog>/landing/kafka_export/`, used by `free_edition`).
-Populate the Volume first with `scripts/export_kafka_to_volume.py` +
-`databricks fs cp`. Both modes share the same `@dp.table` registration —
-idempotency comes from Lakeflow's incremental streaming-table model (`kafka`)
-or a full materialized-view recompute every run (`volume`), not from an
-explicit checkpoint, so re-running in either mode never duplicates rows. This
-is the same dual-path decision informally cited elsewhere as "ADR-05" — see
-`docs/adr/007_pipeline_unification.md`.
+**Bronze has two source_modes — volume (dev/free_edition, permanent) and kafka (prod, target state)**
+`volume` is the correct, permanent mode for `dev` and `free_edition` in this
+project, not a temporary workaround: both run on the same Databricks
+workspace/serverless compute, which cannot reach the self-hosted Kafka broker
+(outbound network is restricted to a fixed allowlist, not customizable outside
+the Enterprise tier). `kafka` is `prod`'s target mode — documented for where
+`prod` is headed once Kafka runs on infrastructure Databricks can actually
+reach, not a confirmed-working setting today. `pipelines/ubereats_pipeline.py`'s
+`register_bronze()` reads a pipeline-level `ubereats.source_mode` configuration
+value: `volume` (`spark.read` batch off `/Volumes/<catalog>/landing/kafka_export/`,
+`dev`/`free_edition`) or `kafka` (`spark.readStream`, `prod`). Populate the
+Volume first with `scripts/export_kafka_to_volume.py` + `databricks fs cp`.
+Both modes share the same `@dp.table` registration — idempotency comes from a
+full materialized-view recompute every run (`volume`) or Lakeflow's incremental
+streaming-table model (`kafka`), not from an explicit checkpoint, so re-running
+in either mode never duplicates rows. See
+`docs/adr/007_pipeline_unification.md`'s 2026-06-19 addendum for the decision
+record.
 
 **databricks.yml: one pipeline + one 1-task Job, identical across all 3 targets**
 Free Edition only supports serverless compute — no `job_cluster_key`/
@@ -133,9 +136,12 @@ ubereats_dev/
 │                  left in place as a follow-up cleanup, not yet removed
 └── landing/     ← 1 Volume (kafka_export) — Parquet snapshot of the 20 Kafka
                    topics, written by scripts/export_kafka_to_volume.py, read
-                   by register_bronze() in source_mode=volume (Free Edition)
+                   by register_bronze() in source_mode=volume (dev, permanent —
+                   same Volume also backs free_edition)
 
-ubereats_prod/ ← same structure (source_mode=kafka only — landing/ unused)
+ubereats_prod/ ← same structure (source_mode=kafka, prod's target mode once
+                 Kafka is reachable from Databricks — not yet verified, so
+                 landing/ is unused only until that changes)
 ```
 
 ## Domain map (20 tables)
