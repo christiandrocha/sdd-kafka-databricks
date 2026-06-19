@@ -199,13 +199,28 @@ def register_silver(contract: dict, bronze_table: str) -> None:
         return candidate.join(bad, merge_key, "left_anti")
 
     dp.create_streaming_table(name=silver_table, cluster_by=cluster_by)
-    dp.create_auto_cdc_flow(
-        target=silver_table,
-        source=clean_view,
-        keys=[merge_key],
-        sequence_by=col("__source_ts_ms"),
-        stored_as_scd_type=1,
-    )
+    if SOURCE_MODE == "kafka":
+        dp.create_auto_cdc_flow(
+            target=silver_table,
+            source=clean_view,
+            keys=[merge_key],
+            sequence_by=col("__source_ts_ms"),
+            stored_as_scd_type=1,
+        )
+    else:
+        # clean_view is a fully-recomputed batch view in volume mode (Addendum 4,
+        # docs/adr/007_pipeline_unification.md) — create_auto_cdc_flow requires a
+        # streaming source ("View ... is not a streaming view") and rejects it.
+        # create_auto_cdc_from_snapshot_flow is the documented batch/snapshot variant:
+        # each run's clean_view is treated as one complete snapshot, diffed against the
+        # prior one, with no sequence_by needed since there's no per-row ordering to make
+        # explicit — the snapshot itself is the unit of recency.
+        dp.create_auto_cdc_from_snapshot_flow(
+            target=silver_table,
+            source=clean_view,
+            keys=[merge_key],
+            stored_as_scd_type=1,
+        )
 
 
 def _prepped_users(bronze_table: str):

@@ -1295,3 +1295,47 @@ JOIN; guard `row_number()` retrofitado nos 2 Gold que ainda não tinham.
   esse modo — não implementado preventivamente nesta entrada.
 
 ### Status: in_progress — pendente confirmação via run real
+
+---
+
+## 2026-06-19 — register_silver() — create_auto_cdc_flow rejeita clean_view como view não-streaming (volume mode)
+
+### Implemented
+- Re-rodado `dev` após o fix anterior: as 10 tabelas `quarantine.<domain>` passaram, mas todas
+  as 10 tabelas `silver.<domain>` falharam com
+  `pyspark.errors.exceptions.captured.AnalysisException: View '<domain>_silver_clean' is not
+  a streaming view and must be referenced using read.` — confirma a pergunta aberta da entrada
+  anterior: `create_auto_cdc_flow` exige source streaming, e `clean_view` é batch em
+  `volume` mode (consequência do fix anterior).
+- `pipelines/ubereats_pipeline.py` — `register_silver()` agora ramifica por `SOURCE_MODE` na
+  chamada final: `kafka` mantém `create_auto_cdc_flow(..., sequence_by=col("__source_ts_ms"))`;
+  `volume` passa a usar `create_auto_cdc_from_snapshot_flow(target=silver_table,
+  source=clean_view, keys=[merge_key], stored_as_scd_type=1)` — a variante batch/snapshot
+  documentada da Databricks para esse caso exato (cada run = um snapshot completo, sem
+  `sequence_by` porque não há ordenação por linha a expressar).
+- `docs/adr/007_pipeline_unification.md` — "Addendum 5 (2026-06-19)" documentando o erro, o fix,
+  e por que a alternativa `pipelines.incompatibleViewCheck.enabled = false` (citada na própria
+  mensagem de erro) foi rejeitada — suprimiria o check em vez de corrigir o descompasso
+  semântico (snapshot completo tratado como stream incremental) que o check existe para apontar.
+
+### Decisions made during build
+- Pesquisado via WebFetch a assinatura completa de `create_auto_cdc_from_snapshot_flow` antes
+  de implementar — confirma que não tem `sequence_by` (o snapshot inteiro é a unidade de
+  recência) e que a forma simples (passar um nome de view/tabela batch como `source`) é
+  exatamente o caso de uso aqui, sem precisar da forma complexa (lambda com versionamento).
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py` → sem erros de sintaxe.
+- `ruff check pipelines/ubereats_pipeline.py` → mesmos 11 findings pré-existentes (`F821
+  spark`), nenhum novo.
+- `PYTHONPATH=. pytest tests/test_contracts.py tests/test_dlt_adapter.py -q` → 196 passed,
+  0 regressões.
+- Não verificado contra um run real do Lakeflow nesta sessão ainda — pendente do próximo
+  `databricks bundle deploy -t dev` + `bundle run`, terceira tentativa consecutiva nesta
+  sessão, cada uma destravando exatamente uma falha e revelando a próxima.
+
+### Open questions
+- Nenhuma quanto à escolha da API — `create_auto_cdc_from_snapshot_flow` é a variante
+  documentada para exatamente este caso. Pendente apenas confirmação via run real.
+
+### Status: in_progress — pendente confirmação via run real

@@ -250,6 +250,39 @@ don't state a hard streaming-source requirement for the `source` argument (only
 verifying empirically via the next `dev` run rather than switching APIs preemptively, to avoid
 a second speculative architecture change without a confirmed need.
 
+The next `dev` run confirmed the speculative need: `create_auto_cdc_flow` does require a
+streaming source after all (see Addendum 5).
+
+## Addendum 5 (2026-06-19) — `create_auto_cdc_flow` rejects `clean_view` as non-streaming in volume mode
+
+Addendum 4's fix unblocked the quarantine tables, but the next `dev` run failed all 10
+generic Silver targets with `pyspark.errors.exceptions.captured.AnalysisException: View
+'<domain>_silver_clean' is not a streaming view and must be referenced using read` —
+`create_auto_cdc_flow`'s `source` *does* require a streaming view, resolving Addendum 4's
+open question. `clean_view` is a batch temporary view in `volume` mode (it reads
+`candidate_view`/`quarantine_table` via `dp.read()`, per Addendum 4), so `create_auto_cdc_flow`
+rejects it outright rather than silently degrading.
+
+**Fix:** for `volume` mode, swap `create_auto_cdc_flow` for `create_auto_cdc_from_snapshot_flow`
+— Databricks' documented batch/snapshot AUTO CDC variant. It takes the same `target`/`source`/
+`keys`/`stored_as_scd_type` arguments but no `sequence_by`: instead of ordering CDC events by a
+sequence column, it treats each pipeline run's `source` as one complete snapshot and diffs it
+against the previous run's snapshot — which matches `volume` mode's actual semantics (full
+recompute = one full snapshot per run) more precisely than `create_auto_cdc_flow` ever did.
+`kafka` mode is unaffected — it keeps `create_auto_cdc_flow` with `sequence_by=col
+("__source_ts_ms")`, since its `clean_view` genuinely is a streaming view fed by a real Kafka
+stream. Rejected alternative: setting the pipeline-level Spark conf
+`pipelines.incompatibleViewCheck.enabled = false` (named directly in the error message) to
+suppress the check — would have "fixed" the symptom while keeping the semantic mismatch
+(treating a full snapshot as an incremental CDC stream) the API itself warns against; the
+snapshot-flow variant has no such mismatch to suppress.
+
+Verified with `ruff check` (no new findings beyond the `F821 spark` baseline) and the
+196-test suite. Confirmation that `create_auto_cdc_from_snapshot_flow` actually succeeds
+against the real `dev` workspace is the next run's job — this is the third fix applied
+without a successful end-to-end `dev` run yet, each prior one having unblocked exactly one
+failure and surfaced the next.
+
 ## See also
 
 `.claude/sdd/features/DESIGN_PIPELINE_UNIFICATION.md` — full design, file manifest, and code
