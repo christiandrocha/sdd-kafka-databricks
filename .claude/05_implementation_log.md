@@ -1493,4 +1493,15 @@ testada), revelando a falha tratada na entrada seguinte.
   `create_auto_cdc_flow`) sobre o `silver.*` `STREAMING_TABLE` existente vai funcionar sem
   conflito — ainda não testado, pendente do próximo run.
 
-### Status: in_progress — pendente run real
+### Status: resolved — run em `dev` (run_id 584817317820436) terminou `TERMINATED SUCCESS` em
+~1m35s. Confirmado via `databricks tables get` que as 6 tabelas Gold existem
+(`payments_by_status`, `payment_funnel`, `payment_lifecycle`, `driver_performance`,
+`revenue_per_restaurant`, `user_behavior`) — nenhuma delas tinha sido criada em nenhum run
+anterior nesta sessão. Primeiro run end-to-end limpo das 37 tabelas (20 Bronze + 11 Silver +
+11 Quarantine + 6 Gold) depois de 8 addenda consecutivos no ADR-007, cada um destravando
+exatamente a próxima falha na cadeia: decorator (2) → ciclo DAG (2) → timestampNtz (3) →
+streaming source não-append-only (4) → snapshot-flow exige source streaming (5) → agregação
+streaming sem watermark (6) → Bronze revertido para Auto Loader (6) → snapshot-flow exige
+unicidade de key (7) → LeftAnti join stream-stream (8). A troca de flow do Addendum 7 não
+precisou de DROP — confirmado que foi mesmo só redefinição de flow, não mudança de tipo de
+dataset, como previsto.

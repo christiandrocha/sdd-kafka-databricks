@@ -417,6 +417,20 @@ No dataset-type changes here (`_clean()` is a temporary view, not a persisted ta
 drop was needed before the next run. Verified with `ruff check` (no new findings) and the
 193-test suite.
 
+The next `dev` run after this fix succeeded end-to-end: `TERMINATED SUCCESS`, all 37 tables
+(20 Bronze, 11 Silver including `users`, 6 Gold, all 11 Quarantine tables) created, confirmed
+live via `databricks tables get` on all 6 Gold tables (none had ever been created in any prior
+run this session). The Silver flow-type swap from Addendum 7
+(`create_auto_cdc_from_snapshot_flow` → `create_auto_cdc_flow` on an already-existing
+`STREAMING_TABLE`) turned out not to need a drop after all — it's a flow redefinition, not a
+dataset-type change, exactly as predicted. This closes out the 8-addendum chain this ADR
+accumulated in a single session: decorator mismatch (2) → DAG cycle (2) → `timestampNtz` (3)
+→ non-append-only streaming source (4) → snapshot-flow source-type requirement (5) → streaming
+aggregation without watermark (6) → Bronze reverted to Auto Loader (6) → snapshot-flow
+duplicate-key requirement (7) → stream-stream `LeftAnti` join (8). Each fix unblocked exactly
+the next failure in the chain; none were anticipated from reading the code alone — all 8 were
+discovered from live Lakeflow pipeline event logs against the real `dev` workspace.
+
 ## See also
 
 `.claude/sdd/features/DESIGN_PIPELINE_UNIFICATION.md` — full design, file manifest, and code
