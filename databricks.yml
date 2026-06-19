@@ -605,6 +605,9 @@ variables:
         # relies on it since every @dp.table name in bronze_silver_dlt.py is already
         # fully-qualified (bronze/silver/quarantine), so the value here is unused.
         schema: bronze
+        # The real workspace behind dev/prod/free_edition is a Free Edition account,
+        # which only supports serverless compute for Lakeflow pipelines.
+        serverless: true
         continuous: false
         libraries:
           - file:
