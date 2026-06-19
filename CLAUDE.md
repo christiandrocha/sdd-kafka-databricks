@@ -1,4 +1,4 @@
-# sdd-kafka-databricks v1.1.0
+# sdd-kafka-databricks v1.2.0
 
 **Platform:** Uber Eats food delivery (Brazilian market)
 **Pipeline:** JSON exports → PostgreSQL → Debezium → Kafka → Databricks → Unity Catalog → DABs
@@ -14,8 +14,8 @@
 | Largest table | order_items (110,001 — 85% of volume) |
 | Hub table | orders (links all via CPF, CNPJ, driver_id, UUID) |
 | Unity Catalog | ubereats_dev / ubereats_prod |
-| Bronze+Silver execution | Lakeflow pipeline (dev/prod) or 2 parametrized notebooks (free_edition) — see below |
-| Notebooks | silver_users (1) + 6 cross-domain gold + 2 parametrized bronze/silver (free_edition only) |
+| Pipeline execution | One Lakeflow pipeline (`ubereats_pipeline`), all 3 targets (dev/prod/free_edition) — see below |
+| Notebooks | 0 — all 8 legacy notebooks retired (v1.2.0); logic ported into `pipelines/ubereats_pipeline.py` |
 | Silver domains | 11 (payment_current_state dropped — covered by gold_payment_lifecycle) |
 
 ## What changed from sdd-kafka-snowflake
@@ -23,7 +23,7 @@
 | Component | sdd-kafka-snowflake | sdd-kafka-databricks |
 |---|---|---|
 | Destination | Snowflake Sink Connector | Databricks Structured Streaming |
-| Transformation | dbt | Lakeflow Declarative Pipelines (dev/prod) + parametrized PySpark notebooks (free_edition) |
+| Transformation | dbt | Lakeflow Declarative Pipelines (one pipeline, all 3 targets) |
 | Orchestration | Dagster | Databricks Asset Bundles (DABs) |
 | Storage | Snowflake VARIANT | Delta Lake 3.1 + Liquid Clustering |
 | Catalog | Snowflake schemas | Unity Catalog (ubereats_dev/prod) |
@@ -39,29 +39,30 @@ Debezium envelope — there is no unwrap step in Silver. Topology is
 unidirectional (JSON exports → Postgres → Debezium → Kafka), so the
 audit-trail argument for skipping the SMT does not apply here. See ADR-02.
 
-**2 parametrized notebooks, not 60 — free_edition only since v1.1.0**
-pipeline_bronze.ipynb and pipeline_silver.ipynb receive table_name, kafka_topic,
-contract_path as widgets. DABs orchestrates them 20x (bronze) and 11x (silver).
-See ADR-03. As of v1.1.0 this only runs for the `free_edition` target — `dev`/`prod`
-use the Lakeflow pipeline below instead. Both notebooks remain fully functional
-and unmodified; `free_edition`'s 37-task job is byte-for-byte unchanged.
-
-**Bronze+Silver on Lakeflow Declarative Pipelines (dev/prod, v1.1.0)**
-`pipelines/bronze_silver_dlt.py` loops over `contracts/*.yml` and registers one
-`@dp.table` per Bronze domain (20) and one Silver `@dp.table` + quarantine pair
-per Silver domain (10 of the 11 — `silver_users` keeps its own notebook, see
-below), replacing the 30 `bronze_*`/`silver_*` DABs tasks with a single
-`pipeline_task` for `dev`/`prod`. This directly fixes Unity Catalog Lineage
-grouping every parametrized notebook execution under one node — each domain is
-now its own lineage node. `dlt.create_auto_cdc_flow()` (the renamed
-`apply_changes()`) replaces the hand-written `MERGE INTO` for the `merge_key`
-upsert; `check: unique` (see below) is a stream-static join inside the
-quarantine table's function body, since `@dp.expect` can't express cross-row
-checks. This deliberately overrides ADR-03's original rejection of DLT/Lakeflow
-for Bronze+Silver only — Gold, `silver_users`, and `free_edition` keep ADR-03's
-original reasoning ("less explicit control"), since none of them has the
-lineage-grouping problem this migration fixes. See
-`docs/adr/006_lakeflow_migration.md`.
+**One Lakeflow pipeline for everything, all 3 targets (v1.2.0)**
+`pipelines/ubereats_pipeline.py` (renamed from `bronze_silver_dlt.py`) loops
+over `contracts/*.yml` and registers one `@dp.table` per Bronze domain (20)
+and one Silver `@dp.table` + quarantine pair per generic Silver domain (10 of
+the 11), then adds `silver_users`/`quarantine.users` (FULL OUTER JOIN of
+`bronze.users_mongo`+`bronze.users_mssql`, ported from the retired
+`pipeline_users.ipynb`) and all 6 Gold tables (`@dp.table` + `dp.read(silver_*)`,
+ported from the retired `notebooks/cross_domain/gold_*.ipynb`) — 37 tables, one
+DAG. `dev`, `prod`, and `free_edition` all reference the same pipeline resource
+and the same 1-task Job, differing only by `variables:` (`catalog`,
+`bronze_source_mode`, `landing_base`). `dlt.create_auto_cdc_flow()` (the
+renamed `apply_changes()`) replaces the hand-written `MERGE INTO` for the 10
+generic Silver domains' `merge_key` upsert; Gold/`silver_users` are full
+batch-recompute `@dp.table` materialized views instead (no MERGE — a full
+recompute is already what their old `MERGE INTO ... WHEN MATCHED UPDATE SET *`
+amounted to, since each run re-aggregates over the complete Silver table).
+`check: unique` (see below) is a stream-static join inside the quarantine
+table's function body, since `@dp.expect` can't express cross-row checks. This
+supersedes `ADR-006`'s "Explicitly NOT migrated" section (Gold, `silver_users`,
+`free_edition`) — none of those exclusion reasons survived once Gold's logic
+ported cleanly into `@dp.table` bodies and `free_edition` turned out to share
+the same workspace (and therefore the same open Kafka-reachability question)
+as `dev`/`prod`. All 8 legacy notebooks are retired. See
+`docs/adr/006_lakeflow_migration.md` and `docs/adr/007_pipeline_unification.md`.
 
 **Dataset framing**
 129k records is an architectural microcosm, not a production volume.
@@ -69,25 +70,32 @@ The goal is validating correctness of MERGE idempotency, Data Contracts,
 and Liquid Clustering alignment — not demonstrating Petabyte throughput.
 
 **Bronze has two source_modes — kafka (default) and volume (Free Edition)**
-Databricks Free Edition's serverless compute can't reach a self-hosted Kafka
-broker (outbound network is restricted to a fixed allowlist, not customizable
-outside the Enterprise tier). `pipeline_bronze.ipynb` accepts `source_mode`:
-`kafka` (default, `spark.readStream` + checkpoint, used by `dev`/`prod`) or
-`volume` (`spark.read` batch off `/Volumes/<catalog>/landing/kafka_export/`,
-used by the `free_edition` DABs target). Populate the Volume first with
-`scripts/export_kafka_to_volume.py` + `databricks fs cp`. Both modes share
-the same contract/DDL/MERGE logic — idempotency comes from
-`MERGE INTO ... WHEN NOT MATCHED`, not from the checkpoint, so re-running in
-either mode never duplicates rows. See ADR-05.
+Databricks Free Edition's serverless compute may not reach a self-hosted
+Kafka broker (outbound network is restricted to a fixed allowlist, not
+customizable outside the Enterprise tier) — unverified as of v1.2.0, design
+supports both outcomes. `pipelines/ubereats_pipeline.py`'s `register_bronze()`
+reads a pipeline-level `ubereats.source_mode` configuration value: `kafka`
+(default, `spark.readStream`, used by `dev`/`prod`) or `volume` (`spark.read`
+batch off `/Volumes/<catalog>/landing/kafka_export/`, used by `free_edition`).
+Populate the Volume first with `scripts/export_kafka_to_volume.py` +
+`databricks fs cp`. Both modes share the same `@dp.table` registration —
+idempotency comes from Lakeflow's incremental streaming-table model (`kafka`)
+or a full materialized-view recompute every run (`volume`), not from an
+explicit checkpoint, so re-running in either mode never duplicates rows. This
+is the same dual-path decision informally cited elsewhere as "ADR-05" — see
+`docs/adr/007_pipeline_unification.md`.
 
-**databricks.yml: classic compute (dev/prod) vs. serverless (free_edition)**
+**databricks.yml: one pipeline + one 1-task Job, identical across all 3 targets**
 Free Edition only supports serverless compute — no `job_cluster_key`/
-`new_cluster` allowed. DABs can't exclude a root-level resource from one
-target ([databricks/cli#2872](https://github.com/databricks/cli/issues/2872)),
-so the 37 tasks are defined once as YAML anchors (`task_definitions`) and
-each target (`dev`, `prod`, `free_edition`) owns its own
-`resources.jobs.ubereats_pipeline`, referencing either `classic_tasks` (with
-`job_cluster_key`) or `serverless_tasks` (without). See ADR-06.
+`new_cluster` anywhere in the file, for any target. DABs can't exclude a
+root-level resource from one target
+([databricks/cli#2872](https://github.com/databricks/cli/issues/2872)), so
+each target (`dev`, `prod`, `free_edition`) still owns its own
+`resources.pipelines.ubereats_pipeline`/`resources.jobs.ubereats_pipeline` —
+but as of v1.2.0 both are identical aliases of one shared anchor pair
+(`pipeline_resource`/`pipeline_task`), not three different shapes. Targets
+differ only by `variables:` (`catalog`, `bronze_source_mode`, `landing_base`).
+See `docs/adr/007_pipeline_unification.md`.
 
 **Gold dimension joins must target a column enforced unique in Silver**
 3 of the 6 Gold notebooks join a Silver dimension on a column that is not that
@@ -99,10 +107,10 @@ table's `merge_key` (`gold_user_behavior` → `silver.users.user_id`, real key
 (`gold_user_behavior`). Fixed with two layers, not one: (1) a new contract
 quality-rule type, `check: unique`, enforced in Silver via anti-join against
 the existing table (`contracts/drivers.yml`/`contracts/restaurants.yml`,
-translated by `contracts/dlt_adapter.py` for the Lakeflow pipeline in dev/prod
-and implemented directly in `pipeline_silver.ipynb` for free_edition;
-`pipeline_users.ipynb` has the equivalent by hand for `user_id` since `users`
-has no YAML contract) —
+translated by `contracts/dlt_adapter.py` for `pipelines/ubereats_pipeline.py`,
+which now runs identically across all 3 targets;
+`register_silver_users()` has the equivalent by hand for `user_id` since
+`users` has no YAML contract) —
 violations are quarantined, not silently dropped or resolved; (2) a
 `row_number()` guard kept right before every affected Gold `MERGE`, as
 defense-in-depth for rows that landed before the rule existed. `merge_key`
@@ -118,12 +126,14 @@ ubereats_dev/
 ├── silver/      ← 11 tables (cleansed + deduped + quality rules)
 ├── gold/        ← 6 cross-domain analytics tables
 ├── quarantine/  ← 11 tables (mirrors silver domains)
-├── checkpoints/ ← operational only, no data tables — 2 Volumes (bronze, silver)
-│                  for Structured Streaming checkpoint locations; provisioned
-│                  by scripts/preflight_unity_catalog.sh, not by any notebook
+├── checkpoints/ ← operational only, no data tables — 2 Volumes (bronze, silver),
+│                  provisioned by scripts/preflight_unity_catalog.sh. Unused as
+│                  of v1.2.0: Lakeflow self-manages pipeline storage, so nothing
+│                  in pipelines/ubereats_pipeline.py reads/writes these paths —
+│                  left in place as a follow-up cleanup, not yet removed
 └── landing/     ← 1 Volume (kafka_export) — Parquet snapshot of the 20 Kafka
                    topics, written by scripts/export_kafka_to_volume.py, read
-                   by pipeline_bronze.ipynb in source_mode=volume (Free Edition)
+                   by register_bronze() in source_mode=volume (Free Edition)
 
 ubereats_prod/ ← same structure (source_mode=kafka only — landing/ unused)
 ```
@@ -153,7 +163,7 @@ ubereats_prod/ ← same structure (source_mode=kafka only — landing/ unused)
 | entity | ratings | mysql_ratings | rating_id | 327 |
 | entity | inventory | postgres_inventory | stock_id | 261 |
 
-## Silver domains (11 — have dedicated Silver notebook)
+## Silver domains (11 — registered in pipelines/ubereats_pipeline.py)
 
 payment_events, orders, payments, users
 (merge users_mongo + users_mssql by CPF), drivers, order_items,
