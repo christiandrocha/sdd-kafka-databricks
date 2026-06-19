@@ -1399,4 +1399,58 @@ JOIN; guard `row_number()` retrofitado nos 2 Gold que ainda não tinham.
 - Confirmação do usuário pendente: dropar os 20 `bronze.*` + 10 `quarantine.<domain>` antes do
   próximo run, ou alguma alternativa.
 
-### Status: in_progress — pendente confirmação do usuário sobre DROP de 30 tabelas
+### Status: resolved — usuário confirmou DROP das 30 tabelas, run subsequente passou de
+Bronze/Quarantine sem conflito de tipo (confirmado via `databricks tables get`), revelando a
+falha tratada na entrada seguinte.
+
+---
+
+## 2026-06-19 — register_silver() revertido para streaming uniforme — create_auto_cdc_from_snapshot_flow rejeita status_id duplicado
+
+### Implemented
+- Run em `dev` após o DROP das 30 tabelas passou de Bronze (recriado `STREAMING_TABLE`) e
+  Quarantine (recriado `MATERIALIZED_VIEW`) sem conflito — confirmado nos eventos do pipeline
+  (`INFO STREAMING_TABLE ... has been created` / `INFO Materialized View ... has been
+  created`). Falhou em Silver:
+  `[APPLY_CHANGES_FROM_SNAPSHOT_ERROR.DUPLICATE_KEY_VIOLATION] Found 468 rows for key
+  '{"status_id":"1"}' ... Expected at most 1 row per key.`
+- Verificado `contracts/order_status.yml`: `merge_key: status_id`, sem regra `unique` — é um
+  código de status (pending/confirmed/etc.), não um id único de linha, ao contrário do que a
+  tabela domain-map do CLAUDE.md sugere ao rotulá-lo "PK". `create_auto_cdc_from_snapshot_flow`
+  (Addendum 5) exige exatamente uma linha por key por snapshot e não tem `sequence_by` para
+  desempatar — isso nunca foi um problema com `create_auto_cdc_flow` (CDC tolera múltiplas
+  linhas por key dentro de um batch, escolhendo a mais recente via `sequence_by`).
+- `pipelines/ubereats_pipeline.py` — `register_silver()`: revertido por completo o Addendum
+  4/5. Agora que Bronze é streaming nos dois modos (Addendum 6), não há mais razão para
+  ramificar por `SOURCE_MODE` aqui. `_candidate()`/`_quarantine()`/`_clean()` voltam a
+  `dp.read_stream()` incondicional; a flow final volta a `create_auto_cdc_flow(...,
+  sequence_by=col("__source_ts_ms"), stored_as_scd_type=1)` incondicional — a forma original,
+  antes de todo o desvio Bronze/Silver de hoje, agora legitimamente restaurável.
+- `docs/adr/007_pipeline_unification.md` — "Addendum 7 (2026-06-19)" documentando a causa,
+  o revert completo, e a consequência prática (10 `quarantine.<domain>` precisam de DROP de
+  novo; `silver.*` julgado sem necessidade de DROP já que só a flow muda, não o tipo da
+  tabela — a ser confirmado pelo próximo run, não assumido).
+
+### Decisions made during build
+- Apresentadas 2 opções ao usuário: reverter Silver por completo para streaming uniforme
+  (recomendado) vs. manter `create_auto_cdc_from_snapshot_flow` e adicionar um dedup
+  `row_number()` antes dele. Usuário escolheu o revert completo.
+- Apresentada a questão de dropar `quarantine.*` apenas (necessário, confirmado) vs. dropar
+  `quarantine.*` + `silver.*` preventivamente (por causa do risco incerto de troca de tipo de
+  flow). Usuário escolheu dropar apenas `quarantine.*` e deixar o próximo run revelar se
+  `silver.*` também precisa.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py` → sem erros de sintaxe.
+- `ruff check pipelines/ubereats_pipeline.py` → mesmos 12 findings (baseline `F821 spark` +
+  `CHECKPOINTS_BASE`), nenhum novo.
+- `PYTHONPATH=. pytest tests/ -q` → 193 passed, 0 regressões.
+- Confirmado via `databricks tables get` que os 10 `quarantine.<domain>` estão
+  `MATERIALIZED_VIEW` (precisam voltar a `STREAMING_TABLE`) antes do próximo run.
+
+### Open questions
+- Se a troca de flow (`create_auto_cdc_from_snapshot_flow` → `create_auto_cdc_flow`) sobre o
+  mesmo `silver.*` `STREAMING_TABLE` já existente vai conflitar como os casos anteriores —
+  não dropado preventivamente; o próximo run decide.
+
+### Status: in_progress — pendente DROP dos 10 `quarantine.<domain>` + run real

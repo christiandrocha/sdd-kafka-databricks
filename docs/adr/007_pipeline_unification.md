@@ -344,6 +344,48 @@ Verified with `ruff check` (12 findings, the same `F821 spark` baseline plus one
 `CHECKPOINTS_BASE` constant) and the 193-test suite (unchanged by this addendum). Not yet
 verified against a live Auto Loader read — pending the drop + next run.
 
+The drop + run did confirm Bronze and Quarantine's type conflicts were resolved (both
+recreated with the correct type, observed live), but surfaced a new, unrelated failure in
+Silver — see Addendum 7.
+
+## Addendum 7 (2026-06-19) — create_auto_cdc_from_snapshot_flow rejects order_status's duplicate status_id keys; full revert to streaming Silver
+
+The `dev` run after Addendum 6's drop got past Bronze and Quarantine cleanly (confirmed live:
+`bronze.*` created as `STREAMING_TABLE`, `quarantine.*` as `MATERIALIZED_VIEW`, no dataset-type
+conflicts) and failed in Silver instead:
+`[APPLY_CHANGES_FROM_SNAPSHOT_ERROR.DUPLICATE_KEY_VIOLATION] Found 468 rows for key
+'{"status_id":"1"}' ... Expected at most 1 row per key.` `contracts/order_status.yml` declares
+`merge_key: status_id` with no `unique` rule — `status_id` is a low-cardinality status *code*
+(pending/confirmed/etc., per the domain's name), not a unique row id, contrary to what
+CLAUDE.md's domain-map table implies by labeling it "PK". `create_auto_cdc_from_snapshot_flow`
+(Addendum 5) requires each snapshot to already have exactly one row per key and has no
+`sequence_by` to break ties on duplicates — it surfaced this pre-existing data characteristic
+for the first time, where `create_auto_cdc_flow` (used everywhere before Addendum 5, and by
+`kafka` mode throughout) never had a problem with it: CDC flows tolerate multiple rows per key
+within a batch, picking the latest via `sequence_by`.
+
+**Fix:** full revert of Addendum 4 and 5. Now that Bronze is a true streaming table in both
+modes (Addendum 6), there is no remaining reason for `register_silver()` to branch by
+`SOURCE_MODE` at all — `_candidate()`/`_quarantine()`/`_clean()` go back to unconditional
+`dp.read_stream()`, and the Silver flow goes back to unconditional `create_auto_cdc_flow(...,
+sequence_by=col("__source_ts_ms"), stored_as_scd_type=1)`. This is the simpler, original
+shape from before today's whole Bronze/Silver detour, now legitimately restorable because the
+thing that originally forced the detour (Bronze being a batch materialized view in `volume`
+mode) no longer exists.
+
+**Consequence for the next deploy:** `_quarantine()`'s body reverting to `dp.read_stream()`
+means the 10 generic `quarantine.<domain>` tables — just recreated as `MATERIALIZED_VIEW` by
+the previous run — need to go back to `STREAMING_TABLE`, hitting `CANNOT_CHANGE_DATASET_TYPE`
+a third time unless dropped first. `silver.*` tables' underlying type (`STREAMING_TABLE`, via
+`create_streaming_table()`) is unchanged by this revert — only which flow feeds them changes
+(`create_auto_cdc_from_snapshot_flow` → `create_auto_cdc_flow`), which is a flow redefinition,
+not a dataset-type change, so it was judged unlikely to need its own drop; the next run is
+what actually confirms this rather than a preemptive drop of `silver.*` too.
+
+Verified with `ruff check` (no new findings) and the 193-test suite. Confirmation that
+`create_auto_cdc_flow` cleanly takes over the existing `silver.*` streaming tables from
+`create_auto_cdc_from_snapshot_flow` is the next run's job.
+
 ## See also
 
 `.claude/sdd/features/DESIGN_PIPELINE_UNIFICATION.md` — full design, file manifest, and code

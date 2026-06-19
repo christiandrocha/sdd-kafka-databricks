@@ -155,17 +155,16 @@ def register_silver(contract: dict, bronze_table: str) -> None:
     candidate_view = f"{domain}_silver_candidate"
     clean_view = f"{domain}_silver_clean"
 
-    # volume mode's bronze_table is a @dp.materialized_view() (full recompute every run,
-    # not append-only) — dp.read_stream() against it violates Structured Streaming's
-    # append-only-source requirement. kafka mode's bronze_table is a true incremental
-    # streaming table, so it keeps dp.read_stream(). Mirrors the batch dp.read() pattern
-    # register_silver_users() already uses for the same reason.
-    _read = dp.read_stream if SOURCE_MODE == "kafka" else dp.read
-
+    # Bronze is a true streaming table in both modes (Addendum 6, Auto Loader for volume) —
+    # Silver reads it the same way regardless of mode, and create_auto_cdc_flow tolerates
+    # duplicate merge_key values within a batch by picking the latest via sequence_by, unlike
+    # create_auto_cdc_from_snapshot_flow which requires exact one-row-per-key and has no
+    # sequence_by to break ties (hit in practice: order_status.status_id is a status code,
+    # not a unique id — see docs/adr/007_pipeline_unification.md Addendum 7).
     @dp.temporary_view(name=candidate_view)
     @dp.expect_all(to_warn_expectations(contract, scope="silver"))
     def _candidate():
-        return _read(bronze_table)
+        return dp.read_stream(bronze_table)
 
     row_predicate = quarantine_row_level_predicate(contract, scope="silver")
 
@@ -180,38 +179,23 @@ def register_silver(contract: dict, bronze_table: str) -> None:
     # (docs/adr/005_gold_dimension_join_integrity.md).
     @dp.table(name=quarantine_table, comment=f"Quarantine: {domain}")
     def _quarantine():
-        candidate = _read(candidate_view)
+        candidate = dp.read_stream(candidate_view)
         return candidate.filter(row_predicate) if row_predicate else candidate.limit(0)
 
     @dp.temporary_view(name=clean_view)
     def _clean():
-        candidate = _read(candidate_view)
-        bad = _read(quarantine_table)
+        candidate = dp.read_stream(candidate_view)
+        bad = dp.read_stream(quarantine_table)
         return candidate.join(bad, merge_key, "left_anti")
 
     dp.create_streaming_table(name=silver_table, cluster_by=cluster_by)
-    if SOURCE_MODE == "kafka":
-        dp.create_auto_cdc_flow(
-            target=silver_table,
-            source=clean_view,
-            keys=[merge_key],
-            sequence_by=col("__source_ts_ms"),
-            stored_as_scd_type=1,
-        )
-    else:
-        # clean_view is a fully-recomputed batch view in volume mode (Addendum 4,
-        # docs/adr/007_pipeline_unification.md) — create_auto_cdc_flow requires a
-        # streaming source ("View ... is not a streaming view") and rejects it.
-        # create_auto_cdc_from_snapshot_flow is the documented batch/snapshot variant:
-        # each run's clean_view is treated as one complete snapshot, diffed against the
-        # prior one, with no sequence_by needed since there's no per-row ordering to make
-        # explicit — the snapshot itself is the unit of recency.
-        dp.create_auto_cdc_from_snapshot_flow(
-            target=silver_table,
-            source=clean_view,
-            keys=[merge_key],
-            stored_as_scd_type=1,
-        )
+    dp.create_auto_cdc_flow(
+        target=silver_table,
+        source=clean_view,
+        keys=[merge_key],
+        sequence_by=col("__source_ts_ms"),
+        stored_as_scd_type=1,
+    )
 
 
 def _prepped_users(bronze_table: str):
