@@ -180,6 +180,48 @@ Both fixes verified with `ruff check` (no new findings) and the existing 196-tes
 DAG-cycle check — the cycle itself was only observable via the real Lakeflow pipeline graph,
 not unit tests.
 
+## Addendum 3 (2026-06-19) — `timestampNtz` Delta feature error on Bronze tables (`source_mode=volume`)
+
+A live `dev` run (`source_mode=volume`) failed Delta table creation with an error requiring
+the `timestampNtz` table feature to be manually enabled. Root cause was a type mismatch
+between two independently-correct-looking pieces of code:
+
+**Where the bug actually was:** `contracts/spark_schema.py`'s `to_struct_type()` already maps
+the contract's `timestamp` field type to PySpark's `TimestampType` correctly — but that
+function is never called anywhere in `pipelines/ubereats_pipeline.py`; Bronze relies entirely
+on schema inference (`from_avro` for `kafka` mode, `spark.read.format("parquet")` for `volume`
+mode), so the correct mapping in `spark_schema.py` was dead code with no effect on the actual
+bug. The real defect was in `scripts/export_kafka_to_volume.py`'s `_PYARROW_TYPE_MAP`:
+`"timestamp": pa.timestamp("ms")` (no `tz=`) writes a timezone-naive Arrow/Parquet column
+(`isAdjustedToUTC=false`), which Spark 3.4+ reads back as `TimestampNTZType` rather than
+`TimestampType` — Delta rejects writing a `TIMESTAMP_NTZ` column unless the `timestampNtz`
+table feature is explicitly enabled, hence the error on every Bronze table with a `timestamp`
+contract field, in `volume` mode.
+
+**Fix, two layers:**
+1. `scripts/export_kafka_to_volume.py` — `pa.timestamp("ms")` → `pa.timestamp("ms", tz="UTC")`,
+   so future exports write Parquet with `isAdjustedToUTC=true` and Spark infers `TimestampType`
+   directly. Doesn't help data already exported to the landing Volume under the old schema.
+2. `pipelines/ubereats_pipeline.py`'s `register_bronze()` — after building the Bronze
+   DataFrame (either branch), explicitly `.cast("timestamp")` every field the contract declares
+   `type: timestamp`, sourced from `contract["schema"]`. This makes Bronze's output type the
+   contract's stated type regardless of how the upstream source (Avro logical type or Parquet
+   metadata) happened to encode it — covers both `kafka` (`from_avro`'s `local-timestamp-*`
+   logical types decode to `TimestampNTZType` the same way) and `volume`, and unblocks the
+   already-exported Volume data without needing a re-export/re-upload cycle.
+
+**Why not Option 2 (`TBLPROPERTIES 'delta.feature.timestampNtz' = 'supported'`):** that would
+accept `TIMESTAMP_NTZ` as the column's actual stored type, which is a real semantic difference
+(no timezone) from what every contract declares (`type: timestamp`, mapped to UTC-based
+`TimestampType` everywhere else in the codebase, including `_ingested_at` via
+`current_timestamp()`). Casting at the source keeps one consistent timestamp semantic across
+Bronze regardless of source_mode, instead of letting two source modes produce two different
+column types for the same logical field.
+
+Verified with `ruff check` (no new findings beyond the pre-existing `F821 spark` baseline) and
+the 196-test suite. Not verified against a live Delta write in this session — the next
+`dev` deploy + run is what confirms the `timestampNtz` error is actually gone.
+
 ## See also
 
 `.claude/sdd/features/DESIGN_PIPELINE_UNIFICATION.md` — full design, file manifest, and code

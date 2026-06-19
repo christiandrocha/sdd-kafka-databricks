@@ -1197,4 +1197,53 @@ JOIN; guard `row_number()` retrofitado nos 2 Gold que ainda não tinham.
 
 ### Status: resolved
 
+---
+
+## 2026-06-19 — register_bronze() / export_kafka_to_volume.py — erro timestampNtz no Delta
+
+### Implemented
+- `pipelines/ubereats_pipeline.py` — `register_bronze()` agora monta `timestamp_fields` a
+  partir de `contract["schema"]` (campos com `type: timestamp`) e, após construir o DataFrame
+  de Bronze (qualquer um dos dois branches), faz `.withColumn(field, col(field).cast("timestamp"))`
+  em cada um. Garante `TimestampType` na saída de Bronze independente de como a fonte upstream
+  codificou o campo.
+- `scripts/export_kafka_to_volume.py` — `_PYARROW_TYPE_MAP["timestamp"]` mudou de
+  `pa.timestamp("ms")` para `pa.timestamp("ms", tz="UTC")`, corrigindo a causa raiz no lado da
+  escrita (Parquet sem tz vinha com `isAdjustedToUTC=false`, que o Spark 3.4+ le como
+  `TimestampNTZType`).
+- `docs/adr/007_pipeline_unification.md` — novo "Addendum 3 (2026-06-19)" documentando os dois
+  pontos do bug (onde NÃO estava — `contracts/spark_schema.py` já mapeava corretamente, mas é
+  código morto, nunca chamado pelo pipeline — e onde estava de fato) e por que a opção de
+  `TBLPROPERTIES delta.feature.timestampNtz=supported` foi descartada (aceitaria um tipo
+  semanticamente diferente do que todo o resto do Bronze usa).
+
+### Decisions made during build
+- A investigação solicitada apontava para `contracts/spark_schema.py` como o lugar do bug,
+  mas essa função (`to_struct_type()`) já mapeia `timestamp` → `TimestampType` corretamente
+  e não é chamada em lugar nenhum do pipeline real — é código morto. A causa raiz estava em
+  `scripts/export_kafka_to_volume.py` (schema PyArrow sem timezone), exercitada porque `dev`
+  roda em `source_mode=volume` (ver Addendum 2026-06-19 do ADR-007).
+- Aplicado fix em duas camadas em vez de uma só: o cast explícito em `register_bronze()`
+  (não exige re-exportar/re-fazer upload do Volume já populado) e a correção do schema PyArrow
+  na fonte (para que futuras exportações não dependam do cast como crutch). Ambos resolvem o
+  mesmo bug por ângulos diferentes — escrita e leitura.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py scripts/export_kafka_to_volume.py` →
+  sem erros de sintaxe.
+- `ruff check` em ambos os arquivos → mesmos 11 findings pré-existentes (`F821 spark`), nenhum
+  novo.
+- `PYTHONPATH=. pytest tests/test_contracts.py tests/test_dlt_adapter.py -q` → 196 passed,
+  0 regressões.
+- Não verificado contra um write Delta real nesta sessão — a confirmação definitiva de que o
+  erro `timestampNtz` desaparece só vem do próximo `databricks bundle deploy -t dev` +
+  `bundle run`.
+
+### Open questions
+- Nenhuma quanto ao código. Pendente: re-rodar o pipeline em `dev` para confirmar que o erro
+  `timestampNtz` não recorre (e que o problema de ownership de tabelas MANAGED de runs
+  anteriores, reportado separadamente nesta sessão, não bloqueia de novo).
+
+### Status: resolved
+
 ### Status: resolved

@@ -30,7 +30,7 @@ _PYARROW_TYPE_MAP: dict[str, pa.DataType] = {
     "long": pa.int64(),
     "double": pa.float64(),
     "boolean": pa.bool_(),
-    "timestamp": pa.timestamp("ms"),
+    "timestamp": pa.timestamp("ms", tz="UTC"),
     "date": pa.date32(),
 }
 

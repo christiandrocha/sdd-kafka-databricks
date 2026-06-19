@@ -106,6 +106,7 @@ def register_bronze(contract: dict) -> str:
     cluster_by = contract["storage"]["cluster_by"]
     bronze_table = f"{CATALOG}.bronze.{domain}"
     max_offsets = MAX_OFFSETS_OVERRIDES.get(domain, DEFAULT_MAX_OFFSETS)
+    timestamp_fields = [f["name"] for f in contract["schema"] if f["type"] == "timestamp"]
 
     # source_mode=volume reads with spark.read (batch, full recompute every run) — DLT
     # requires @dp.materialized_view() for that shape. @dp.table() is reserved for the
@@ -127,20 +128,31 @@ def register_bronze(contract: dict) -> str:
                 .load()
                 .select(expr("substring(value, 6)").alias("avro_bytes"))
             )
-            return (
+            df = (
                 raw_stream
                 .select(from_avro(col("avro_bytes"), avro_schema_str).alias("d"))
                 .select("d.*")
                 .withColumn("_ingested_at", current_timestamp())
             )
         elif SOURCE_MODE == "volume":
-            return (
+            df = (
                 spark.read
                 .format("parquet")
                 .load(f"{VOLUME_BASE}/{domain}")
                 .withColumn("_ingested_at", current_timestamp())
             )
-        raise ValueError(f"Unknown source_mode: {SOURCE_MODE!r}")
+        else:
+            raise ValueError(f"Unknown source_mode: {SOURCE_MODE!r}")
+
+        # from_avro's "local-timestamp-*" logical types and Parquet's isAdjustedToUTC=false
+        # columns both decode to TimestampNTZType, which Delta rejects unless the
+        # timestampNtz table feature is explicitly enabled. The contract is the source of
+        # truth: every field it declares "timestamp" is cast to TimestampType here, so
+        # Bronze tables never depend on how the upstream source happened to encode it.
+        for field in timestamp_fields:
+            if field in df.columns:
+                df = df.withColumn(field, col(field).cast("timestamp"))
+        return df
 
     return bronze_table
 
