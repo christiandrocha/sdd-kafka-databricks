@@ -222,6 +222,34 @@ Verified with `ruff check` (no new findings beyond the pre-existing `F821 spark`
 the 196-test suite. Not verified against a live Delta write in this session — the next
 `dev` deploy + run is what confirms the `timestampNtz` error is actually gone.
 
+A live `dev` run after this fix confirmed `timestampNtz` was gone but surfaced a new failure
+(see Addendum 4) caused by Addendum 2's `@dp.materialized_view()` change interacting badly
+with `register_silver()`'s unconditional `dp.read_stream()` calls.
+
+## Addendum 4 (2026-06-19) — `dp.read_stream()` on a non-append-only volume-mode Bronze table
+
+Live `dev` run failed every one of the 10 generic Silver domains' quarantine tables with
+`"we detected an update or delete to one or more rows in the source table. Streaming tables
+may only use append-only streaming sources"` and `"Update ... has failed due to a non-append
+only streaming source."` Root cause: `register_silver()`'s `_candidate()` called
+`dp.read_stream(bronze_table)` unconditionally — fine for `kafka` mode, where `bronze_table` is
+a genuine incremental Kafka streaming table, but broken for `volume` mode after Addendum 2
+made `bronze_table` a `@dp.materialized_view()` (fully recomputed every run, not append-only).
+Reading a non-append-only dataset via `dp.read_stream()` is exactly what Structured Streaming
+forbids. `_quarantine()` and `_clean()` had the same `dp.read_stream()` calls one level down,
+failing for the same reason. `register_silver_users()` was never affected — it already used
+batch `dp.read()` throughout, for the same underlying reason (its FULL OUTER JOIN is a full
+recompute by design).
+
+**Fix:** `register_silver()` now picks `_read = dp.read_stream if SOURCE_MODE == "kafka" else
+dp.read` once per domain, and `_candidate()`/`_quarantine()`/`_clean()` all call `_read(...)`
+instead of hardcoding `dp.read_stream(...)`. `create_streaming_table`/`create_auto_cdc_flow`
+for the `silver_table` target are left unchanged — Databricks' `create_auto_cdc_flow` docs
+don't state a hard streaming-source requirement for the `source` argument (only
+`create_auto_cdc_from_snapshot_flow` is documented as the dedicated batch/snapshot variant);
+verifying empirically via the next `dev` run rather than switching APIs preemptively, to avoid
+a second speculative architecture change without a confirmed need.
+
 ## See also
 
 `.claude/sdd/features/DESIGN_PIPELINE_UNIFICATION.md` — full design, file manifest, and code

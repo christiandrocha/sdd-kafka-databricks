@@ -167,17 +167,24 @@ def register_silver(contract: dict, bronze_table: str) -> None:
     candidate_view = f"{domain}_silver_candidate"
     clean_view = f"{domain}_silver_clean"
 
+    # volume mode's bronze_table is a @dp.materialized_view() (full recompute every run,
+    # not append-only) — dp.read_stream() against it violates Structured Streaming's
+    # append-only-source requirement. kafka mode's bronze_table is a true incremental
+    # streaming table, so it keeps dp.read_stream(). Mirrors the batch dp.read() pattern
+    # register_silver_users() already uses for the same reason.
+    _read = dp.read_stream if SOURCE_MODE == "kafka" else dp.read
+
     @dp.temporary_view(name=candidate_view)
     @dp.expect_all(to_warn_expectations(contract, scope="silver"))
     def _candidate():
-        return dp.read_stream(bronze_table)
+        return _read(bronze_table)
 
     row_predicate = quarantine_row_level_predicate(contract, scope="silver")
     unique_fields = unique_check_fields(contract, scope="silver")
 
     @dp.table(name=quarantine_table, comment=f"Quarantine: {domain}")
     def _quarantine():
-        candidate = dp.read_stream(candidate_view)
+        candidate = _read(candidate_view)
         rowlevel_bad = candidate.filter(row_predicate) if row_predicate else candidate.limit(0)
         unique_bad = (
             _unique_violations(candidate, unique_fields, merge_key)
@@ -187,8 +194,8 @@ def register_silver(contract: dict, bronze_table: str) -> None:
 
     @dp.temporary_view(name=clean_view)
     def _clean():
-        candidate = dp.read_stream(candidate_view)
-        bad = dp.read_stream(quarantine_table)
+        candidate = _read(candidate_view)
+        bad = _read(quarantine_table)
         return candidate.join(bad, merge_key, "left_anti")
 
     dp.create_streaming_table(name=silver_table, cluster_by=cluster_by)

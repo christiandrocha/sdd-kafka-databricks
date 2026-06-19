@@ -1246,4 +1246,52 @@ JOIN; guard `row_number()` retrofitado nos 2 Gold que ainda não tinham.
 
 ### Status: resolved
 
-### Status: resolved
+---
+
+## 2026-06-19 — register_silver() — dp.read_stream() em bronze_table não append-only (volume mode)
+
+### Implemented
+- Re-rodado `dev` após o fix do `timestampNtz`: o erro de timestamp não recorreu, e o
+  conflito de ownership de tabelas MANAGED (reportado antes) também não recorreu — ambos
+  ficam confirmados como resolvidos. Mas surgiu um terceiro erro, novo: todas as 10 tabelas
+  `quarantine.<domain>` dos domínios Silver genéricos falharam com "Streaming tables may only
+  use append-only streaming sources" / "non-append only streaming source".
+- Causa: `register_silver()`'s `_candidate()` chamava `dp.read_stream(bronze_table)`
+  incondicionalmente. Em `kafka` mode isso é correto (bronze é tabela streaming real). Em
+  `volume` mode, o fix anterior (Addendum 2 do ADR-007) tornou `bronze_table` um
+  `@dp.materialized_view()` — recompute completo a cada run, não append-only — e ler isso via
+  `dp.read_stream()` é exatamente o que o Structured Streaming proíbe. `_quarantine()` e
+  `_clean()` tinham o mesmo padrão um nível abaixo. `register_silver_users()` nunca foi afetado
+  porque já usava `dp.read()` (batch) em todo lugar.
+- `pipelines/ubereats_pipeline.py` — `register_silver()` agora define
+  `_read = dp.read_stream if SOURCE_MODE == "kafka" else dp.read` uma vez por domínio, e
+  `_candidate()`/`_quarantine()`/`_clean()` chamam `_read(...)` em vez de `dp.read_stream(...)`
+  hardcoded. `create_streaming_table`/`create_auto_cdc_flow` do `silver_table` ficaram
+  inalterados.
+- `docs/adr/007_pipeline_unification.md` — "Addendum 4 (2026-06-19)" documentando a causa e o
+  fix, e por que `create_auto_cdc_flow` não foi trocado por `create_auto_cdc_from_snapshot_flow`
+  preventivamente (docs da Databricks não declaram um requisito explícito de source streaming
+  para `create_auto_cdc_flow`; a verificação fica para o próximo run real em vez de uma segunda
+  mudança de arquitetura especulativa).
+
+### Decisions made during build
+- Pesquisei via WebSearch/WebFetch (docs.databricks.com) se `create_auto_cdc_flow` exige
+  source streaming antes de decidir trocar para `create_auto_cdc_from_snapshot_flow` — a
+  documentação não confirma nem nega isso explicitamente. Decidido não fazer a troca
+  especulativamente; deixar o próximo run real decidir se é necessário.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py` → sem erros de sintaxe.
+- `ruff check pipelines/ubereats_pipeline.py` → mesmos 11 findings pré-existentes (`F821
+  spark`), nenhum novo.
+- `PYTHONPATH=. pytest tests/test_contracts.py tests/test_dlt_adapter.py -q` → 196 passed,
+  0 regressões.
+- Não verificado contra um run real do Lakeflow nesta sessão ainda — pendente do próximo
+  `databricks bundle deploy -t dev` + `bundle run`.
+
+### Open questions
+- Se `create_auto_cdc_flow` rejeitar `clean_view` como source não-streaming em `volume` mode,
+  o próximo passo seria trocar para `create_auto_cdc_from_snapshot_flow` especificamente para
+  esse modo — não implementado preventivamente nesta entrada.
+
+### Status: in_progress — pendente confirmação via run real
