@@ -63,6 +63,14 @@ variables:
           ubereats.starting_offsets: earliest
           ubereats.source_mode: ${var.bronze_source_mode}
           ubereats.volume_base: ${var.landing_base}
+          # pipelines/ubereats_pipeline.py reads this to sys.path.insert() and locate
+          # contracts/*.yml — Lakeflow pipeline execution has no __file__, so it can't
+          # derive its own source path the way a notebook or plain script could.
+          # ${workspace.file_path} is the DABs-native variable for "where this bundle's
+          # source files were synced" — it already resolves correctly per target
+          # (dev/prod/free_edition) without hand-reconstructing the .bundle/<name>/<target>
+          # path pattern here, including for prod's overridden workspace.root_path.
+          bundle.files.path: ${workspace.file_path}
 
       pipeline_task: &pipeline_task
         task_key: ubereats_pipeline_task

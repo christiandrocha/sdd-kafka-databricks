@@ -1054,3 +1054,55 @@ JOIN; guard `row_number()` retrofitado nos 2 Gold que ainda não tinham.
   risco técnico residual desta feature, registrado no BUILD_REPORT e no ADR.
 
 ### Status: resolved
+
+---
+
+## 2026-06-19 — pipelines/ubereats_pipeline.py — `__file__` indisponível em contexto Lakeflow
+
+### Implemented
+- `pipelines/ubereats_pipeline.py` — substituídos os dois usos de
+  `Path(__file__).resolve().parent.parent` (linha do `sys.path.insert` e
+  `CONTRACTS_DIR`) por um único `BUNDLE_FILES_PATH = spark.conf.get("bundle.files.path", ...)`,
+  lido uma vez no topo do módulo.
+- `databricks.yml` — adicionada `bundle.files.path: ${workspace.file_path}` ao bloco
+  `configuration:` do anchor `pipeline_resource` compartilhado — uma única linha cobre
+  `dev`/`prod`/`free_edition` automaticamente, já que o anchor é o mesmo para os 3 targets.
+
+### Problems encountered
+- O usuário reportou (provavelmente a partir de uma tentativa real de deploy) que
+  `Path(__file__)` falha quando o Lakeflow executa um arquivo `.py` de pipeline — o runtime
+  não executa o arquivo como `python <path>` da forma que um notebook/script comum seria,
+  então `__file__` não fica definido nesse contexto.
+  → A correção pedida pelo usuário cobria só a linha do `sys.path.insert`; `CONTRACTS_DIR`
+    (linha 43) tinha o mesmo padrão e quebraria do mesmo jeito, uma linha depois — corrigido
+    junto, não só o que foi pedido literalmente.
+- O usuário sugeriu reconstruir o path manualmente com
+  `/Workspace/Users/.../.bundle/sdd-kafka-databricks/${bundle.target}/files`.
+  → Esse exato padrão já existia neste repositório como variável `workspace_root`
+    (default: `${workspace.file_path}`), removida no build anterior (PIPELINE_UNIFICATION)
+    por parecer não-usada após a deleção dos 8 notebooks legados — acabou sendo necessária
+    de novo, só que para o pipeline unificado, não para os notebooks.
+  → Solução: usado `${workspace.file_path}` (variável nativa do DABs) em vez de
+    reconstruir o path à mão — resolve corretamente por target sem hardcodar o padrão
+    `.bundle/<name>/<target>` duas vezes, e não quebra se `prod` algum dia tiver um
+    `workspace.root_path` que não siga esse padrão.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py` → sintaxe OK; `grep __file__` só
+  encontra o comentário explicativo, nenhum uso real restante.
+- `yaml.safe_load(databricks.yml)` → `bundle.files.path: ${workspace.file_path}` presente
+  na configuração resolvida dos 3 targets (`dev`/`prod`/`free_edition`).
+- `databricks bundle validate --target {dev,prod,free_edition}` → mesma limitação de
+  ambiente já registrada (token OAuth expirado), mas resolve a YAML/anchors corretamente
+  antes de falhar na autenticação — nenhuma regressão estrutural.
+- `ruff check .` → All checks passed.
+- `PYTHONPATH=. pytest tests/test_contracts.py tests/test_dlt_adapter.py -q` → 196 passed,
+  0 regressões (suite não afetada por esta mudança).
+
+### Open questions
+- Esta correção não foi confirmada contra um workspace real — mesma limitação de ambiente
+  de todas as features anteriores. Validação live continua pendente (ver
+  `.claude/sdd/archive/PIPELINE_UNIFICATION/SHIPPED_2026-06-19.md`, seção de
+  Recommendations).
+
+### Status: resolved

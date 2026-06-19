@@ -27,7 +27,15 @@ from pyspark.sql.functions import (
     when,
 )
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Lakeflow Declarative Pipelines execute this file without __file__ defined (it's not run
+# as `python <path>` the way a notebook or a plain script is) — bundle.files.path (set in
+# databricks.yml's pipeline configuration via the DABs-native ${workspace.file_path}
+# variable) replaces every Path(__file__) usage below.
+BUNDLE_FILES_PATH = spark.conf.get(
+    "bundle.files.path",
+    "/Workspace/Users/christiandr@gmail.com/.bundle/sdd-kafka-databricks/dev/files",
+)
+sys.path.insert(0, BUNDLE_FILES_PATH)
 from contracts.dlt_adapter import (
     quarantine_row_level_predicate,
     to_reject_expectations,
@@ -40,7 +48,7 @@ CATALOG = spark.conf.get("ubereats.catalog", "ubereats_dev")
 KAFKA_BOOTSTRAP = spark.conf.get("ubereats.kafka_bootstrap", "localhost:9092")
 SCHEMA_REGISTRY_URL = spark.conf.get("ubereats.schema_registry_url", "http://localhost:8081")
 STARTING_OFFSETS = spark.conf.get("ubereats.starting_offsets", "earliest")
-CONTRACTS_DIR = Path(__file__).resolve().parent.parent / "contracts"
+CONTRACTS_DIR = Path(BUNDLE_FILES_PATH) / "contracts"
 
 # PIPELINE_UNIFICATION: source_mode replaces the per-task `volume_path`/`source_mode` widgets
 # pipeline_bronze.ipynb used to take — one pipeline-level setting now drives all 20 domains,
