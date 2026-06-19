@@ -1339,3 +1339,64 @@ JOIN; guard `row_number()` retrofitado nos 2 Gold que ainda não tinham.
   documentada para exatamente este caso. Pendente apenas confirmação via run real.
 
 ### Status: in_progress — pendente confirmação via run real
+
+---
+
+## 2026-06-19 — register_silver() check:unique removido + register_bronze() volta a streaming table via Auto Loader
+
+### Implemented
+- Run em `dev` foi cancelado (job 255308898705286) ao falhar com
+  `[CANNOT_CHANGE_DATASET_TYPE] Cannot change the dataset type ... from STREAMING_TABLE to
+  MATERIALIZED_VIEW for ubereats_dev.quarantine.payments` — conflito de metadata do Unity
+  Catalog, não um bug de código novo. Cancelado via `databricks jobs cancel-run` em vez de
+  deixar exaurir retries (cada retry teria o mesmo resultado).
+- `pipelines/ubereats_pipeline.py` — `register_silver()`: removida toda a lógica de
+  `check: unique` em quarantine (`_unique_violations()`, `unique_fields`, `unique_bad`).
+  `_quarantine()` agora só aplica `row_predicate`. Causa: `COUNT(DISTINCT merge_key)` dentro de
+  `groupBy().agg()` não é suportado em streaming sem watermark — `_unique_violations()` rodaria
+  isso sobre um DataFrame de streaming real em `kafka` mode. Arquitetura correta: `check:
+  unique` é propriedade de merge-time do Silver, não um gate de quarantine pré-merge; os
+  guards `row_number()` em `register_gold_driver_performance()`/
+  `register_gold_revenue_per_restaurant()` continuam sendo a defesa real.
+- `contracts/dlt_adapter.py` — removida `unique_check_fields()` (sem mais nenhum chamador).
+  Docstring de `quarantine_row_level_predicate()` atualizada.
+- `tests/test_dlt_adapter.py` — removidos o import e os 3 testes de `unique_check_fields`
+  (196 → 193 testes).
+- `pipelines/ubereats_pipeline.py` — `register_bronze()`: revertido `@dp.materialized_view()`
+  (Addendum 2) para `@dp.table()` incondicional. `volume` mode passa a usar Auto Loader
+  (`spark.readStream.format("cloudFiles")` com `cloudFiles.format=parquet`) em vez de
+  `spark.read.format("parquet")` batch — Bronze fica streaming/append-only/imutável nos dois
+  modos, igual à convenção Medallion. Novo `CHECKPOINTS_BASE` aponta para o Volume
+  `checkpoints/bronze` (provisionado por `scripts/preflight_unity_catalog.sh`, documentado
+  como não-usado até agora) para `cloudFiles.schemaLocation`.
+- `docs/adr/007_pipeline_unification.md` — "Addendum 6 (2026-06-19)" documentando os dois
+  fixes, o trade-off aceito (unique não é mais detectado em quarantine, mitigado pelos guards
+  de Gold), o follow-up não corrigido (`export_kafka_to_volume.py` sobrescreve o mesmo
+  `data.parquet`, Auto Loader por padrão não reprocessa caminho já visto), e a consequência
+  prática: os 20 `bronze.*` (agora `MATERIALIZED_VIEW` → precisam ser `STREAMING_TABLE`) e os
+  10 `quarantine.<domain>` genéricos (ainda `STREAMING_TABLE` → precisam ser
+  `MATERIALIZED_VIEW`, Addendum 4) somam 30 tabelas que precisam de DROP antes do próximo run.
+
+### Decisions made during build
+- Verificado via `databricks tables get` contra o workspace real (não assumido) que: os 20
+  `bronze.*` estão `MATERIALIZED_VIEW`, os 10 `quarantine.<domain>` genéricos estão
+  `STREAMING_TABLE`, `silver.*` e `quarantine.users` já estão no tipo correto (sem conflito).
+- Não revertida a ramificação por `SOURCE_MODE` em `register_silver()` (Addendum 4/5) mesmo
+  com Bronze voltando a streaming — `dp.read()` (batch) contra uma streaming table é válido e
+  já usado em outro lugar do mesmo arquivo (Gold lendo Silver), e o pedido do usuário era
+  escopado só a `register_bronze()`.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py contracts/dlt_adapter.py
+  tests/test_dlt_adapter.py` → sem erros de sintaxe.
+- `ruff check` → 12 findings (mesmo baseline `F821 spark` + 1 novo para `CHECKPOINTS_BASE`,
+  mesma causa raiz).
+- `PYTHONPATH=. pytest tests/ -q` → 193 passed, 0 regressões.
+- Não verificado contra um run real ainda — pendente confirmação do usuário sobre o DROP das
+  30 tabelas antes do próximo `databricks bundle deploy -t dev` + `bundle run`.
+
+### Open questions
+- Confirmação do usuário pendente: dropar os 20 `bronze.*` + 10 `quarantine.<domain>` antes do
+  próximo run, ou alguma alternativa.
+
+### Status: in_progress — pendente confirmação do usuário sobre DROP de 30 tabelas

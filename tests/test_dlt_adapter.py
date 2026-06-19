@@ -7,7 +7,6 @@ from contracts.dlt_adapter import (
     quarantine_row_level_predicate,
     to_reject_expectations,
     to_warn_expectations,
-    unique_check_fields,
 )
 from contracts.loader import load_contract
 
@@ -22,7 +21,6 @@ def test_adapter_runs_on_every_real_contract(contract_path: Path) -> None:
     to_reject_expectations(contract, scope="bronze")
     to_warn_expectations(contract, scope="silver")
     quarantine_row_level_predicate(contract, scope="silver")
-    unique_check_fields(contract, scope="silver")
 
 
 def test_condition_sql_not_null() -> None:
@@ -111,29 +109,3 @@ def test_quarantine_row_level_predicate_excludes_unique_check() -> None:
 def test_quarantine_row_level_predicate_none_when_no_rules() -> None:
     contract = {"quality": {"rules": []}}
     assert quarantine_row_level_predicate(contract, scope="silver") is None
-
-
-def test_unique_check_fields_returns_only_unique_quarantine_rules() -> None:
-    contract = {
-        "quality": {
-            "rules": [
-                {
-                    "field": "a", "check": "unique",
-                    "on_failure": "quarantine", "scope": ["silver"],
-                },
-                {
-                    "field": "b", "check": "not_null",
-                    "on_failure": "quarantine", "scope": ["silver"],
-                },
-                {"field": "c", "check": "unique", "on_failure": "warn", "scope": ["silver"]},
-            ]
-        }
-    }
-    assert unique_check_fields(contract, scope="silver") == ["a"]
-
-
-@pytest.mark.parametrize("domain", ["drivers", "restaurants"])
-def test_drivers_and_restaurants_unique_rule_reaches_adapter(domain: str) -> None:
-    contract = load_contract(CONTRACTS_DIR / f"{domain}.yml")
-    fields = unique_check_fields(contract, scope="silver")
-    assert len(fields) == 1

@@ -22,8 +22,9 @@ def to_warn_expectations(contract: dict, scope: str) -> dict[str, str]:
 def quarantine_row_level_predicate(contract: dict, scope: str) -> str | None:
     """SQL boolean: True quando a linha FALHA alguma regra quarantine que nao seja 'unique'.
 
-    check=unique e' tratado separadamente (unique_check_fields) porque exige um anti-join
-    contra o estado atual da tabela Silver, nao uma expressao linha-a-linha.
+    check=unique nao tem expressao linha-a-linha (exige comparar contra outras linhas) e
+    nao e' enforced em quarantine — e' uma propriedade de merge-time do Silver, nao do
+    estagio Bronze->Silver pre-merge; ver docs/adr/007_pipeline_unification.md Addendum 6.
     """
     rules = [
         r for r in contract["quality"]["rules"]
@@ -33,14 +34,6 @@ def quarantine_row_level_predicate(contract: dict, scope: str) -> str | None:
         return None
     fail_conditions = [f"NOT ({_condition_sql(r)})" for r in rules]
     return " OR ".join(fail_conditions)
-
-
-def unique_check_fields(contract: dict, scope: str) -> list[str]:
-    """Campos com check=unique, on_failure=quarantine, no scope dado."""
-    return [
-        r["field"] for r in contract["quality"]["rules"]
-        if scope in r["scope"] and r["on_failure"] == "quarantine" and r["check"] == "unique"
-    ]
 
 
 def _condition_sql(rule: dict) -> str:

@@ -40,7 +40,6 @@ from contracts.dlt_adapter import (
     quarantine_row_level_predicate,
     to_reject_expectations,
     to_warn_expectations,
-    unique_check_fields,
 )
 from contracts.loader import load_contract
 
@@ -55,6 +54,14 @@ CONTRACTS_DIR = Path(BUNDLE_FILES_PATH) / "contracts"
 # for whichever target (dev/prod/free_edition) sets it. See docs/adr/007_pipeline_unification.md.
 SOURCE_MODE = spark.conf.get("ubereats.source_mode", "kafka")
 VOLUME_BASE = spark.conf.get("ubereats.volume_base", "/Volumes/ubereats_dev/landing/kafka_export")
+
+# Auto Loader's cloudFiles.schemaLocation, one per domain — the checkpoints/bronze Volume
+# provisioned by scripts/preflight_unity_catalog.sh, previously unused (Lakeflow self-manages
+# its own streaming-table checkpoints; this is specifically Auto Loader's separate schema
+# inference state, which Lakeflow does not manage on its own).
+CHECKPOINTS_BASE = spark.conf.get(
+    "ubereats.checkpoints_base", f"/Volumes/{CATALOG}/checkpoints/bronze"
+)
 
 # ADR-08: order_items is 85% of total volume (110,001 records) — the same maxOffsetsPerTrigger
 # used for every other domain would take ~110 micro-batches instead of 1-5. Was a per-task
@@ -79,27 +86,6 @@ def _avro_schema_str(kafka_topic: str) -> str:
     return resp.json()["schema"]
 
 
-def _unique_violations(candidate_df, fields, merge_key):
-    """Self-join confinado a' candidate_df — porta _unique_violation_values() de
-    pipeline_silver.ipynb para uma transformacao declarativa. A versao original lia
-    spark.read.table(silver_table) (o lado estatico), mas isso faz quarantine depender
-    do proprio silver_table que ela alimenta via clean_view -> create_auto_cdc_flow,
-    formando um ciclo no DAG do DLT (restaurants e drivers, os dois dominios com regra
-    check: unique). O anti-join agora compara apenas dentro do batch corrente: qualquer
-    valor de `field` que aponte para mais de um `merge_key` distinto e' violacao."""
-    bad = candidate_df.sparkSession.createDataFrame([], candidate_df.schema).limit(0)
-    for field in fields:
-        dup_values = (
-            candidate_df.select(field, merge_key).distinct()
-            .groupBy(field)
-            .agg(countDistinct(merge_key).alias("_distinct_keys"))
-            .filter(col("_distinct_keys") > 1)
-            .select(field)
-        )
-        bad = bad.unionByName(candidate_df.join(dup_values, field, "left_semi"))
-    return bad.distinct()
-
-
 def register_bronze(contract: dict) -> str:
     domain = contract["table"]["name"]
     kafka_topic = contract["table"]["kafka_topic"]
@@ -108,12 +94,12 @@ def register_bronze(contract: dict) -> str:
     max_offsets = MAX_OFFSETS_OVERRIDES.get(domain, DEFAULT_MAX_OFFSETS)
     timestamp_fields = [f["name"] for f in contract["schema"] if f["type"] == "timestamp"]
 
-    # source_mode=volume reads with spark.read (batch, full recompute every run) — DLT
-    # requires @dp.materialized_view() for that shape. @dp.table() is reserved for the
-    # spark.readStream path (source_mode=kafka), where the engine tracks incremental state.
-    bronze_decorator = dp.materialized_view if SOURCE_MODE == "volume" else dp.table
-
-    @bronze_decorator(name=bronze_table, cluster_by=cluster_by, comment=f"Bronze: {domain}")
+    # Bronze is always a streaming table — append-only and immutable, per the Medallion
+    # convention this project follows (CLAUDE.md). volume mode uses Auto Loader (cloudFiles)
+    # instead of a plain batch spark.read.parquet so it stays a true incremental stream
+    # reading newly-arrived files from the landing Volume, the same way kafka mode streams
+    # newly-arrived Kafka records — neither mode ever needs @dp.materialized_view().
+    @dp.table(name=bronze_table, cluster_by=cluster_by, comment=f"Bronze: {domain}")
     @dp.expect_all_or_drop(to_reject_expectations(contract, scope="bronze"))
     def _bronze():
         if SOURCE_MODE == "kafka":
@@ -136,8 +122,10 @@ def register_bronze(contract: dict) -> str:
             )
         elif SOURCE_MODE == "volume":
             df = (
-                spark.read
-                .format("parquet")
+                spark.readStream
+                .format("cloudFiles")
+                .option("cloudFiles.format", "parquet")
+                .option("cloudFiles.schemaLocation", f"{CHECKPOINTS_BASE}/{domain}_schema")
                 .load(f"{VOLUME_BASE}/{domain}")
                 .withColumn("_ingested_at", current_timestamp())
             )
@@ -180,17 +168,20 @@ def register_silver(contract: dict, bronze_table: str) -> None:
         return _read(bronze_table)
 
     row_predicate = quarantine_row_level_predicate(contract, scope="silver")
-    unique_fields = unique_check_fields(contract, scope="silver")
 
+    # check: unique is not enforced here — it would need a cross-row aggregation
+    # (COUNT(DISTINCT merge_key) per field value), which Structured Streaming rejects
+    # without a watermark in kafka mode ("COUNT(DISTINCT ...) not supported in streaming").
+    # Architecturally, uniqueness is a Silver-merge-time property (Silver already dedupes by
+    # merge_key), not something a pre-merge Bronze->Silver quarantine gate should police — a
+    # row can look "duplicate" pre-merge and still be valid. The row_number() guards in
+    # register_gold_driver_performance()/register_gold_revenue_per_restaurant() remain the
+    # actual defense-in-depth for the Gold dimension joins this rule protects
+    # (docs/adr/005_gold_dimension_join_integrity.md).
     @dp.table(name=quarantine_table, comment=f"Quarantine: {domain}")
     def _quarantine():
         candidate = _read(candidate_view)
-        rowlevel_bad = candidate.filter(row_predicate) if row_predicate else candidate.limit(0)
-        unique_bad = (
-            _unique_violations(candidate, unique_fields, merge_key)
-            if unique_fields else candidate.limit(0)
-        )
-        return rowlevel_bad.unionByName(unique_bad).distinct()
+        return candidate.filter(row_predicate) if row_predicate else candidate.limit(0)
 
     @dp.temporary_view(name=clean_view)
     def _clean():

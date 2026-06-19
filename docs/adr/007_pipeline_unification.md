@@ -283,6 +283,67 @@ against the real `dev` workspace is the next run's job — this is the third fix
 without a successful end-to-end `dev` run yet, each prior one having unblocked exactly one
 failure and surfaced the next.
 
+## Addendum 6 (2026-06-19) — check: unique removed from Quarantine; Bronze reverted to a true streaming table via Auto Loader
+
+Two more fixes landed before a clean `dev` run was achieved, both requested directly rather
+than discovered from a live failure (the first pre-empts a real but not-yet-hit `kafka`-mode
+bug; the second reverses Addendum 2's decorator choice):
+
+**`check: unique` no longer gates Quarantine.** `_unique_violations()` (Addendum 2's self-join
+version) calls `groupBy(field).agg(countDistinct(merge_key))` on `candidate_df` — in `kafka`
+mode `candidate_df` is a genuine unbounded streaming DataFrame, and `COUNT(DISTINCT ...)`
+inside a streaming `groupBy/agg` is rejected without a watermark
+(`"COUNT(DISTINCT uuid) is not supported in streaming without watermark"`). This was latent —
+`dev` never hit it because it runs in `volume` mode, where the aggregation was batch — but
+real for `prod`'s `kafka` mode. Fixed by removing `_unique_violations()` and
+`unique_check_fields()` entirely: `_quarantine()` now only applies the row-level predicate.
+Architecturally this is the more correct shape anyway — `check: unique` is a Silver
+merge-time property (Silver already dedupes by `merge_key`), not a Bronze→Silver streaming
+quarantine gate; a row can look "duplicate" pre-merge and still resolve to a valid Silver row.
+The `row_number()` guards in `register_gold_driver_performance()`/
+`register_gold_revenue_per_restaurant()` remain the actual defense-in-depth for the Gold
+dimension joins this contract rule protects (`docs/adr/005_gold_dimension_join_integrity.md`)
+— unchanged by this fix. The YAML contracts (`drivers.yml`/`restaurants.yml`) still declare
+`check: unique`; it's just no longer translated into pipeline enforcement.
+
+**Bronze reverted from `@dp.materialized_view()` back to `@dp.table()` (true streaming) in
+volume mode**, replacing Addendum 2's batch `spark.read.format("parquet")` with Auto Loader:
+`spark.readStream.format("cloudFiles").option("cloudFiles.format", "parquet")`. Medallion
+convention treats Bronze as append-only and immutable; a full-batch-recompute materialized
+view technically violates that even though it was functionally adequate. Auto Loader lets
+volume mode stream newly-arrived files the same way kafka mode streams newly-arrived Kafka
+records, so Bronze no longer needs two different fundamental table types depending on mode —
+`@dp.table()` is now unconditional in `register_bronze()`. Auto Loader's schema inference
+needs its own checkpoint (`cloudFiles.schemaLocation`), separate from the streaming-table
+checkpoint Lakeflow already self-manages — this is the first real use of the
+`checkpoints/bronze` Volume `scripts/preflight_unity_catalog.sh` provisions (previously
+documented as unused infrastructure, CLAUDE.md's Unity Catalog structure section). `register_silver()`'s
+`SOURCE_MODE`-branched reads (Addendum 4) and CDC flow choice (Addendum 5) are **not**
+reverted — `dp.read()` (batch) against a now-genuinely-streaming Bronze table is still valid
+(Gold already does the same thing reading Silver's streaming tables elsewhere in this file),
+so Silver keeps treating each `volume`-mode run as one full snapshot of Bronze's current
+accumulated state. Reverting that too was judged out of scope for this fix and not asked for.
+
+**Known follow-up, not fixed here:** `scripts/export_kafka_to_volume.py` always overwrites
+the same `data.parquet` path per domain. Auto Loader's default file-tracking will not
+reprocess a modified file at an already-seen path, so re-exporting after the first successful
+Bronze ingestion would silently not propagate — would need either unique per-export file
+names or `cloudFiles.allowOverwrites = true`. Not exercised by this session's single Volume
+snapshot, so left as a flagged gap rather than fixed speculatively.
+
+**Consequence for the next deploy:** this is the second decorator reversal in the same
+session (Addendum 2 made Bronze `MATERIALIZED_VIEW`; this addendum makes it `STREAMING_TABLE`
+again) — the 20 Bronze tables currently persisted in `ubereats_dev` as `MATERIALIZED_VIEW`
+will hit the same `CANNOT_CHANGE_DATASET_TYPE` conflict already identified for the 10 generic
+`quarantine.*` tables (Addendum 4 made those `MATERIALIZED_VIEW`; they're still persisted as
+`STREAMING_TABLE` from before). Both sets need to be dropped before the next run for Lakeflow
+to recreate them with the correct type — confirmed via `databricks tables get` against the
+live `dev` catalog before writing this addendum, not assumed.
+
+Verified with `ruff check` (12 findings, the same `F821 spark` baseline plus one for the new
+`CHECKPOINTS_BASE` constant) and the 193-test suite (unchanged by this addendum). Not yet
+verified against a live Auto Loader read — pending the drop + next run.
+
 ## See also
 
 `.claude/sdd/features/DESIGN_PIPELINE_UNIFICATION.md` — full design, file manifest, and code
