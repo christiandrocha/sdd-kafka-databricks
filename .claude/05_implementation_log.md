@@ -1453,4 +1453,44 @@ falha tratada na entrada seguinte.
   mesmo `silver.*` `STREAMING_TABLE` já existente vai conflitar como os casos anteriores —
   não dropado preventivamente; o próximo run decide.
 
-### Status: in_progress — pendente DROP dos 10 `quarantine.<domain>` + run real
+### Status: resolved — usuário confirmou dropar só `quarantine.<domain>`; run passou de
+Bronze/Quarantine de novo (sem conflito de tipo, e a troca de flow em Silver nem chegou a ser
+testada), revelando a falha tratada na entrada seguinte.
+
+---
+
+## 2026-06-19 — _clean() fazia LeftAnti join stream-stream — quarantine_table não deveria ser lido por mais nada
+
+### Implemented
+- Run em `dev` após o revert do Addendum anterior falhou identicamente nos 10 domínios Silver
+  genéricos: `LeftAnti joins with a streaming DataFrame/Dataset on the right are not
+  supported.` Cancelado o job em andamento (run 207907731626341) já que o erro recorreria em
+  todo retry.
+- Causa: `_clean()` fazia `candidate.join(dp.read_stream(quarantine_table), merge_key,
+  "left_anti")` — os dois lados streaming. Structured Streaming não suporta join
+  LeftAnti/LeftSemi stream-stream com fonte streaming do lado direito. Esse código já existia
+  ANTES desta sessão (não foi introduzido por nenhum fix de hoje) — só nunca rodou, porque toda
+  tentativa anterior hoje falhava antes de `_clean()` (conflitos de ownership UC,
+  `timestampNtz`, conflitos de tipo de dataset, o erro de duplicate-key do snapshot-flow).
+- `pipelines/ubereats_pipeline.py` — `register_silver()`: `_clean()` não lê mais
+  `quarantine_table`. Aplica o complemento booleano de `row_predicate` direto em
+  `candidate_view` (`candidate.filter(f"NOT ({row_predicate})")`), em vez de recomputar via
+  anti-join contra a tabela já materializada. Isso finalmente realiza por completo o padrão
+  pedido no início desta sessão (Silver e Quarantine leem da MESMA view upstream; Quarantine
+  usa o predicado; Clean usa o complemento; nenhuma tabela lê outra do mesmo nível) —
+  `quarantine_table` agora é escrita mas não lida por mais nada no pipeline.
+- `docs/adr/007_pipeline_unification.md` — "Addendum 8 (2026-06-19)" documentando a causa, o
+  fix, e que não há mudança de tipo de dataset envolvida (`_clean()` é view temporária, não
+  tabela persistida) — sem necessidade de DROP antes do próximo run.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py` → sem erros de sintaxe.
+- `ruff check pipelines/ubereats_pipeline.py` → mesmos 12 findings, nenhum novo.
+- `PYTHONPATH=. pytest tests/ -q` → 193 passed, 0 regressões.
+
+### Open questions
+- Se a troca de flow do Addendum 7 (`create_auto_cdc_from_snapshot_flow` →
+  `create_auto_cdc_flow`) sobre o `silver.*` `STREAMING_TABLE` existente vai funcionar sem
+  conflito — ainda não testado, pendente do próximo run.
+
+### Status: in_progress — pendente run real

@@ -182,11 +182,17 @@ def register_silver(contract: dict, bronze_table: str) -> None:
         candidate = dp.read_stream(candidate_view)
         return candidate.filter(row_predicate) if row_predicate else candidate.limit(0)
 
+    # Inverse of _quarantine()'s predicate, applied directly to candidate_view rather than
+    # anti-joining against quarantine_table — Structured Streaming doesn't support a
+    # stream-stream LeftAnti join with a streaming DataFrame on the right ("LeftAnti joins
+    # with a streaming DataFrame/Dataset on the right are not supported"), which is what
+    # candidate.join(dp.read_stream(quarantine_table), ..., "left_anti") was. Silver and
+    # Quarantine both read only from candidate_view now — no table reads another table at
+    # the same level.
     @dp.temporary_view(name=clean_view)
     def _clean():
         candidate = dp.read_stream(candidate_view)
-        bad = dp.read_stream(quarantine_table)
-        return candidate.join(bad, merge_key, "left_anti")
+        return candidate.filter(f"NOT ({row_predicate})") if row_predicate else candidate
 
     dp.create_streaming_table(name=silver_table, cluster_by=cluster_by)
     dp.create_auto_cdc_flow(

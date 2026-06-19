@@ -386,6 +386,37 @@ Verified with `ruff check` (no new findings) and the 193-test suite. Confirmatio
 `create_auto_cdc_flow` cleanly takes over the existing `silver.*` streaming tables from
 `create_auto_cdc_from_snapshot_flow` is the next run's job.
 
+The flow-type swap itself was never tested — the run failed earlier, in `_clean()` (Addendum 8).
+
+## Addendum 8 (2026-06-19) — stream-stream LeftAnti join in `_clean()` was never valid; quarantine_table is no longer read by anything
+
+The `dev` run after Addendum 7 got past Bronze and Quarantine again (no dataset-type
+conflicts — the open question about Silver's flow-type swap never even got tested) and failed
+identically across every one of the 10 generic Silver domains:
+`LeftAnti joins with a streaming DataFrame/Dataset on the right are not supported`. Root
+cause: `_clean()` did `candidate.join(dp.read_stream(quarantine_table), merge_key,
+"left_anti")` — both sides streaming. Structured Streaming does not support a stream-stream
+`LeftAnti`/`LeftSemi` join with a streaming source on the right side, full stop; this is not
+mode-specific or a recent regression — `_clean()` has read `quarantine_table` via
+`dp.read_stream()` since before this session started, and nothing in today's many fixes ever
+touched it. It simply never got exercised: every earlier attempt today failed on something
+upstream (UC ownership conflicts, `timestampNtz`, dataset-type conflicts, the snapshot-flow
+duplicate-key error) before Silver's `_clean()` flow ever actually ran.
+
+**Fix:** `_clean()` no longer reads `quarantine_table` at all. It applies the literal inverse
+of `_quarantine()`'s own `row_predicate` directly to `candidate_view`
+(`candidate.filter(f"NOT ({row_predicate})")`), instead of computing the bad rows once in
+`quarantine_table` and then re-deriving "not bad" by anti-joining against it. This is exactly
+the convention asked for at the very start of today's session and only partially realized
+until now: Silver and Quarantine both read only from the same upstream `candidate_view`,
+Quarantine uses the row-level predicate, Clean uses its boolean complement, and no table reads
+another table at the same level — `quarantine_table` is now written but never read by anything
+else in the pipeline.
+
+No dataset-type changes here (`_clean()` is a temporary view, not a persisted table), so no
+drop was needed before the next run. Verified with `ruff check` (no new findings) and the
+193-test suite.
+
 ## See also
 
 `.claude/sdd/features/DESIGN_PIPELINE_UNIFICATION.md` — full design, file manifest, and code
