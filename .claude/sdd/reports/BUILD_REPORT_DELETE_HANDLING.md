@@ -105,6 +105,39 @@ This conclusively verifies the **input** to `register_silver()`'s `apply_as_dele
 logic is now correct. It does **not** verify what Lakeflow actually does with that
 input — that requires a real Databricks pipeline run.
 
+### CI Status (GitHub Actions)
+
+Added 2026-06-20, after this report was first written: this build's commit
+(`37f08b5`) merged into `master` via PR #1, which surfaced that CI had been
+failing on **every single run since the repo's first commit** — unrelated to
+this feature's own code, but discovered while shipping it. Root causes (both
+pre-existing, neither introduced by this build):
+
+1. `pytest tests/ -v` (CI's literal command) doesn't add the repo root to
+   `sys.path` the way `python -m pytest` (what was used for every local
+   verification in this report) does — `from contracts...` imports failed
+   with `ModuleNotFoundError`. Fixed via `pythonpath = ["."]` under
+   `[tool.pytest.ini_options]` in `pyproject.toml` (PR #2).
+2. `yamllint contracts/` rejected the contracts' deliberate column-aligned
+   flow style against yamllint's strict defaults. Fixed via a new
+   `.yamllint.yml` relaxing only the 4 conflicting rules (PR #2).
+3. `bundle-validate` had no `DATABRICKS_HOST`/`DATABRICKS_TOKEN` repo secrets
+   configured at all. Fixed by creating `DATABRICKS_KAFKA_HOST`/
+   `DATABRICKS_KAFKA_TOKEN` secrets + repointing `ci.yml`'s `secrets.*`
+   references to match (PR #3).
+
+**Current status: all 4 CI jobs green on both `main` and `master`**
+(`env-guard`, `lint`, `test`, `bundle-validate` — verified via
+`gh run view` after each PR merge).
+
+**This does not change this report's Blockers or Final Status below.**
+`bundle-validate` is `databricks bundle validate` — static config validation
+against the DABs schema, not a pipeline run. It confirms `databricks.yml`
+parses and resolves correctly for the `dev`/`free_edition` targets; it does
+not execute `pipelines/ubereats_pipeline.py`, so it says nothing about
+`apply_as_deletes` runtime behavior. The Databricks/Lakeflow-side
+verification gap is unchanged.
+
 ### What Was NOT Verified (and why)
 
 | Item | Why not verified | What's needed |
