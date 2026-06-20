@@ -194,29 +194,50 @@ def register_silver(contract: dict, bronze_table: str) -> None:
         candidate = dp.read_stream(candidate_view)
         return candidate.filter(f"NOT ({row_predicate})") if row_predicate else candidate
 
+    # DESIGN_DELETE_HANDLING.md Decision 2: apply_as_deletes makes a Debezium
+    # delete-rewrite row (__op='d') actually remove the matching Silver row
+    # instead of upserting its (otherwise NULL-only-without-REPLICA-IDENTITY-
+    # FULL) payload via UPDATE SET *. Requires REPLICA IDENTITY FULL on the
+    # source table (sql/init.sql) — without it, every non-key field in the
+    # delete event is NULL and gets caught by this domain's own quarantine
+    # rules before ever reaching this flow. See kb/anti-patterns.md (C08).
     dp.create_streaming_table(name=silver_table, cluster_by=cluster_by)
     dp.create_auto_cdc_flow(
         target=silver_table,
         source=clean_view,
         keys=[merge_key],
         sequence_by=col("__source_ts_ms"),
+        apply_as_deletes=expr("__op = 'd'"),
         stored_as_scd_type=1,
     )
 
 
 def _prepped_users(bronze_table: str):
+    # DESIGN_DELETE_HANDLING.md Decision 1/2: __op='d' rows are no longer
+    # dropped here — they must survive into _dedup_by_cpf() so a delete that
+    # is the LATEST event for a cpf_key can exclude that user entirely,
+    # instead of always falling back to the second-latest (live) row, which
+    # froze deleted users at their last live state forever (see C08).
     return (
         dp.read(bronze_table)
-        .filter(col("__op") != "d")
         .withColumn("cpf_key", regexp_replace(col("cpf"), r"[.\-]", ""))
     )
 
 
 def _dedup_by_cpf(df):
     """Keep the latest row per cpf_key (highest __source_ts_ms) — ported from
-    pipeline_users.ipynb's dedup_by_cpf()."""
+    pipeline_users.ipynb's dedup_by_cpf() — then drop the cpf_key entirely if
+    that latest row is a delete (__op='d'). Requires REPLICA IDENTITY FULL on
+    users_mongo/users_mssql (sql/init.sql) so cpf survives into the delete
+    event — cpf is not the Postgres primary key (uuid is), so without FULL the
+    delete event's cpf is NULL and never reaches this function at all."""
     w = Window.partitionBy("cpf_key").orderBy(desc("__source_ts_ms"))
-    return df.withColumn("_rn", row_number().over(w)).filter(col("_rn") == 1).drop("_rn")
+    return (
+        df.withColumn("_rn", row_number().over(w))
+        .filter(col("_rn") == 1)
+        .filter(col("__op") != "d")
+        .drop("_rn")
+    )
 
 
 def _to_quarantine_shape(df, source: str, reason: str):

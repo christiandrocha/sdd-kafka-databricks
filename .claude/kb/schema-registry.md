@@ -119,8 +119,12 @@ setting means downstream code has to actively decide what to do with a field
 like this, not just assume the registry blocking incompatible changes is
 enough: `export_kafka_to_volume.py`'s `_cast_record()` explicitly drops it;
 `register_bronze()` in `pipelines/ubereats_pipeline.py` does not, so it flows
-into Bronze as schema drift in `kafka` mode. See `kb/anti-patterns.md` (C08)
-and `CLAUDE.md` for why this field exists and what (if anything) should read it.
+into Bronze as schema drift in `kafka` mode. This is still true after the C08
+delete-handling fix (2026-06-20, `kb/anti-patterns.md`) — the fix uses `__op`
+(declared, already relied upon elsewhere), not `__deleted`, as the
+`apply_as_deletes` condition, precisely to avoid depending on this undeclared
+field. `__deleted` itself remains unread, undeclared schema drift either way.
+See `kb/anti-patterns.md` (C08) and `CLAUDE.md` for the full mechanism.
 
 ## Schema Registry REST API
 

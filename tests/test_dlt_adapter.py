@@ -109,3 +109,20 @@ def test_quarantine_row_level_predicate_excludes_unique_check() -> None:
 def test_quarantine_row_level_predicate_none_when_no_rules() -> None:
     contract = {"quality": {"rules": []}}
     assert quarantine_row_level_predicate(contract, scope="silver") is None
+
+
+@pytest.mark.parametrize("contract_path", ALL_CONTRACTS, ids=_IDS)
+def test_quarantine_predicate_never_references_op_or_deleted(contract_path: Path) -> None:
+    """DESIGN_DELETE_HANDLING.md Decision 1/2: a Debezium delete-rewrite row
+    must be evaluated against the SAME quarantine predicate any other row
+    would — its real field values (non-null thanks to REPLICA IDENTITY FULL,
+    sql/init.sql) either satisfy each rule or don't, exactly like a live row.
+    There is no __op/__deleted special-case here by design — that logic
+    lives in register_silver()'s create_auto_cdc_flow(apply_as_deletes=...)
+    instead. If this test ever fails, someone added op-aware routing to the
+    quarantine gate, which would defeat Decision 1 (C08 fix)."""
+    contract = load_contract(contract_path)
+    predicate = quarantine_row_level_predicate(contract, scope="silver")
+    if predicate:
+        assert "__op" not in predicate
+        assert "__deleted" not in predicate

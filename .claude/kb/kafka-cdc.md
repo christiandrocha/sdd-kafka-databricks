@@ -62,28 +62,38 @@ incremental (`source_ts_ms DESC` no ROW_NUMBER, `source_ts_ms > MAX(source_ts_ms
 ### delete.handling.mode=rewrite + drop.tombstones=false
 
 DELETEs não são descartados — o SMT os reescreve como eventos normais com `__op=d`
-no payload, em vez de emitir um tombstone. **Mas isso não significa que o
-registro chega com seus valores completos**: nenhuma tabela deste projeto
-define `REPLICA IDENTITY FULL` (confirmado: zero ocorrências no repo), então o
-Postgres só loga a chave primária no before-image de um DELETE — todo o resto
-vem `null`. Confirmado ao vivo no log do próprio Debezium: `"REPLICA IDENTITY
-for 'public.payments' is 'DEFAULT'; UPDATE and DELETE events will contain
-previous values only for PK columns"`. O rewrite usa esse before-image
-incompleto, então o registro reescrito tem só a PK preenchida + `__op=d` +
-`__deleted="true"` (confirmado presente no schema Avro registrado).
+no payload, em vez de emitir um tombstone. **Fix aplicado em 2026-06-20**
+(`DESIGN_DELETE_HANDLING.md`): todas as 20 tabelas agora definem `REPLICA
+IDENTITY FULL` (`sql/init.sql` + `scripts/migrate_replica_identity.sh` para
+instâncias já existentes) — antes disso, nenhuma tabela definia `FULL`, então
+o Postgres só logava a chave primária no before-image de um DELETE e todo o
+resto vinha `null` (confirmado ao vivo no log do Debezium:
+`"REPLICA IDENTITY for 'public.payments' is 'DEFAULT'; UPDATE and DELETE
+events will contain previous values only for PK columns"`). Com `FULL`,
+reverifiquei ao vivo pós-fix: o registro de delete agora chega com os mesmos
+valores reais do insert/update anterior (`method`, `status`, `amount`, etc.),
+não apenas a PK — + `__op=d` + `__deleted="true"` (presente no schema Avro
+desde a v1).
 
 Tombstones (mensagens com value=null) são mantidos (`drop.tombstones=false`),
 mas isso é irrelevante para o pipeline atual — `pipelines/ubereats_pipeline.py`
 nunca lê tombstones.
 
-**`register_silver()` (os 10 domínios genéricos) não filtra `__op`/`__deleted`
-hoje** — esse registro flui direto para `create_auto_cdc_flow()`, que (sem
-`apply_as_deletes`) aplica como `UPDATE SET *`, zerando para `NULL` todas as
-colunas não-chave da linha em Silver, permanentemente — o DELETE nunca remove
-a linha. Só `register_silver_users()` filtra `__op != 'd'` (via
-`_prepped_users()`), e só para `users_mongo`/`users_mssql`. Ver
-`.claude/kb/anti-patterns.md` (C08) e `CLAUDE.md` para o mecanismo completo —
-gap confirmado por teste ao vivo (2026-06-20), ainda sem decisão de `/design`.
+**`register_silver()` (os 10 domínios genéricos) agora passa
+`apply_as_deletes=expr("__op = 'd'")` para `create_auto_cdc_flow()`** — o
+DELETE remove a linha de Silver em vez de zerar suas colunas. Isso só
+funciona porque `REPLICA IDENTITY FULL` garante que os campos não-chave não
+chegam `null` (campos `null` cairiam nas mesmas regras de quarentena que
+qualquer linha normal, e toda regra de quarentena nos 10 domínios genéricos
+está em um campo que não é a PK real — ver `DEFINE_DELETE_HANDLING.md`).
+`register_silver_users()` também foi ajustado: `_prepped_users()`/
+`_dedup_by_cpf()` agora deixam o evento de delete passar pelo dedup e só
+excluem o `cpf` se o evento mais recente for um delete — antes, o delete era
+descartado antes do dedup e o usuário ficava congelado no último estado vivo
+para sempre. **Ainda não verificado:** o comportamento real do
+`apply_as_deletes`/`full_refresh` num workspace Databricks de fato — sem
+acesso a um workspace nesta sessão. Ver `.claude/kb/anti-patterns.md` (C08) e
+`CLAUDE.md` para o mecanismo completo.
 
 ## Publication e replication slot
 

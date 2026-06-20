@@ -19,11 +19,13 @@
 **Data quality observability** (see `kb/data-quality.md`, `kb/anti-patterns.md`):
 - Is the data correct? Fresh? Complete?
 - Are rows landing in `quarantine.<domain>` that shouldn't be?
-- **Did a DELETE propagate correctly to Silver/Gold?** — confirmed today it
-  does **not**: a Postgres `DELETE` lands in Silver as a `NULL`-out of every
-  non-key column instead of a row removal (`kb/anti-patterns.md` C08,
-  `CLAUDE.md`). No infra metric in this file would surface that — it's a data
-  correctness gap, not an infra failure, and nothing currently alerts on it.
+- **Did a DELETE propagate correctly to Silver/Gold?** — fixed 2026-06-20
+  (`kb/anti-patterns.md` C08, `CLAUDE.md`): `REPLICA IDENTITY FULL` +
+  `apply_as_deletes` now make this work, verified live on the Postgres/Kafka
+  side. Still no infra metric in this file would have caught the original bug
+  (it was a data correctness gap, not an infra failure) or would catch a
+  regression — a scheduled data-quality check on this is still not
+  implemented, tracked as a follow-up, not just historical color.
 - Tool: `tests/test_contracts.py`/`tests/test_dlt_adapter.py` (structural only,
   see `kb/data-quality.md`'s "what tests actually validate" section) — there
   is no dbt/Great Expectations layer in this project.
@@ -70,10 +72,11 @@ Summary of the 5 alerts currently defined, by metric:
 | `BrokerDown` | `kafka_brokers < 1` for 1m | critical | Entire Kafka cluster unreachable |
 | `UnderReplicatedPartitions` | `kafka_server_replicamanager_underreplicatedpartitions > 0` for 2m | warning | Not relevant for the local single-broker setup, kept for when this targets a real cluster |
 
-None of these would catch the DELETE/NULL-corruption gap (C08) — that needs a
-data-level check (e.g. a scheduled query counting NULL-heavy rows per
-`merge_key` in Silver), not an infra alert. Not implemented; flagged here so
-it isn't assumed to be covered.
+None of these would have caught the DELETE/NULL-corruption gap (C08, fixed
+2026-06-20) — that needed a data-level check (e.g. a scheduled query counting
+NULL-heavy rows per `merge_key` in Silver), not an infra alert, and still
+would for any regression. Not implemented; flagged here so it isn't assumed
+to be covered.
 
 ## Connector status check
 

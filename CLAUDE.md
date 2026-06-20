@@ -39,33 +39,33 @@ Debezium envelope — there is no unwrap step in Silver. Topology is
 unidirectional (JSON exports → Postgres → Debezium → Kafka), so the
 audit-trail argument for skipping the SMT does not apply here. See ADR-02.
 
-**DELETE is not propagated as a delete — confirmed NULL-corruption gap, no ADR yet**
-Verified live against the local stack (2026-06-20): no table sets `REPLICA
-IDENTITY FULL`, so Postgres only logs primary-key columns in the before-image
-of an `UPDATE`/`DELETE` (confirmed via Debezium's own connection log: `"REPLICA
-IDENTITY for 'public.payments' is 'DEFAULT'; UPDATE and DELETE events will
-contain previous values only for PK columns"`). With
-`delete.handling.mode=rewrite`, a deleted row's rewritten Kafka record therefore
-has the merge key populated and **every other field `NULL`** (plus
-`__deleted="true"`, confirmed present in the registered Avro schema). Nothing
-in `register_silver()` filters on `__op`/`__deleted` for the 10 generic Silver
-domains, so this record flows straight into `create_auto_cdc_flow()` — which,
-lacking an `apply_as_deletes` condition, applies it as a normal
-`WHEN MATCHED THEN UPDATE SET *`. **Net effect: a Postgres `DELETE` does not
-remove the row from Silver/Gold — it overwrites every non-key column of the
-existing row with `NULL`, permanently, and the row stays visible everywhere
-downstream.** `users` takes a different, less destructive path:
-`_prepped_users()` filters `__op != 'd'` before the join, so the delete-rewrite
-row itself is dropped — but since `silver.users` is a full batch recompute over
-an append-only Bronze table, the user's last live state before deletion
-persists forever instead (stale, not corrupted). This has never been observed
-in a real pipeline run because `tests/load_to_postgres.py` only does
-`INSERT ... ON CONFLICT DO UPDATE` — no `DELETE` exists anywhere in this
-project's load harness, so the path is real but unexercised. See
-`.claude/kb/anti-patterns.md` (C08) for the full trace. Needs a `/design`
-decision: either set `REPLICA IDENTITY FULL` + pass `apply_as_deletes` to
-`create_auto_cdc_flow()`, or filter `__deleted='true'` into quarantine — no fix
-applied yet, this is a documented-but-open gap.
+**DELETE handling — fix implemented 2026-06-20, Postgres side verified live, Databricks side pending dev verification**
+Originally a confirmed NULL-corruption gap (C08): no table set `REPLICA
+IDENTITY FULL`, so Postgres only logged primary-key columns in the
+before-image of an `UPDATE`/`DELETE`, and `register_silver()` had no
+`apply_as_deletes`, so a delete-rewrite row landed as `WHEN MATCHED THEN
+UPDATE SET *` — NULLing every non-key column instead of removing the row.
+Full design: `.claude/sdd/features/DESIGN_DELETE_HANDLING.md`. Fix shipped in
+3 parts: (1) `sql/init.sql` now sets `REPLICA IDENTITY FULL` on all 20 source
+tables (+ `scripts/migrate_replica_identity.sh` for already-running Postgres
+instances) — **verified live** against the local stack: a test `DELETE` on
+`payments` now produces a Kafka record with every real field populated
+(`method`, `status`, `amount`, `currency`, `country`, ...), not just the merge
+key, matching the preceding INSERT event's values exactly. (2)
+`register_silver()`'s `create_auto_cdc_flow()` now passes
+`apply_as_deletes=expr("__op = 'd'")`, so a delete-rewrite row actually
+removes the target Silver row instead of upserting it. (3)
+`register_silver_users()`'s `_prepped_users()`/`_dedup_by_cpf()` now keep
+delete rows through the dedup window and exclude a `cpf_key` from
+`silver.users` only if its *latest* event is a delete — previously the delete
+row was dropped before dedup, so the user's last live state persisted forever
+instead of being removed. **Not yet verified:** whether `apply_as_deletes`
+needs a `full_refresh=true` run to correctly reprocess already-ingested Bronze
+history — Databricks' public docs don't confirm this either way (checked
+during DESIGN); requires a real Databricks workspace to test, unavailable in
+this session. Treat the Lakeflow-side behavior as implemented-but-unverified
+until that dev test happens. See `.claude/kb/anti-patterns.md` (C08) and
+`.claude/sdd/features/BUILD_REPORT_DELETE_HANDLING.md` for the full trace.
 
 **One Lakeflow pipeline for everything, all 3 targets (v1.2.0)**
 `pipelines/ubereats_pipeline.py` (renamed from `bronze_silver_dlt.py`) loops
