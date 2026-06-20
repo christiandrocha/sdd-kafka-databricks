@@ -61,10 +61,29 @@ incremental (`source_ts_ms DESC` no ROW_NUMBER, `source_ts_ms > MAX(source_ts_ms
 
 ### delete.handling.mode=rewrite + drop.tombstones=false
 
-DELETEs não são descartados. O SMT os reescreve como eventos normais com `__op=d`
-no payload — o registro deleted chega no Kafka com seus valores e `__op=d`.
-Tombstones (mensagens com value=null) são mantidos (`drop.tombstones=false`).
-Os Silver models filtram `op != 'd'` para excluir DELETEs do estado atual.
+DELETEs não são descartados — o SMT os reescreve como eventos normais com `__op=d`
+no payload, em vez de emitir um tombstone. **Mas isso não significa que o
+registro chega com seus valores completos**: nenhuma tabela deste projeto
+define `REPLICA IDENTITY FULL` (confirmado: zero ocorrências no repo), então o
+Postgres só loga a chave primária no before-image de um DELETE — todo o resto
+vem `null`. Confirmado ao vivo no log do próprio Debezium: `"REPLICA IDENTITY
+for 'public.payments' is 'DEFAULT'; UPDATE and DELETE events will contain
+previous values only for PK columns"`. O rewrite usa esse before-image
+incompleto, então o registro reescrito tem só a PK preenchida + `__op=d` +
+`__deleted="true"` (confirmado presente no schema Avro registrado).
+
+Tombstones (mensagens com value=null) são mantidos (`drop.tombstones=false`),
+mas isso é irrelevante para o pipeline atual — `pipelines/ubereats_pipeline.py`
+nunca lê tombstones.
+
+**`register_silver()` (os 10 domínios genéricos) não filtra `__op`/`__deleted`
+hoje** — esse registro flui direto para `create_auto_cdc_flow()`, que (sem
+`apply_as_deletes`) aplica como `UPDATE SET *`, zerando para `NULL` todas as
+colunas não-chave da linha em Silver, permanentemente — o DELETE nunca remove
+a linha. Só `register_silver_users()` filtra `__op != 'd'` (via
+`_prepped_users()`), e só para `users_mongo`/`users_mssql`. Ver
+`.claude/kb/anti-patterns.md` (C08) e `CLAUDE.md` para o mecanismo completo —
+gap confirmado por teste ao vivo (2026-06-20), ainda sem decisão de `/design`.
 
 ## Publication e replication slot
 
@@ -100,8 +119,15 @@ pg.public.drivers           pg.public.products       pg.public.menu_sections
 pg.public.ratings           pg.public.inventory
 ```
 
-20 tópicos no total. `order_items` vai para o conector `sinkitems` (buffer maior).
-Os outros 19 vão para o conector `sink`.
+20 tópicos no total. Não existe Kafka Sink Connector neste projeto — havia
+`sink`/`sinkitems` no `sdd-kafka-snowflake` (que empurrava para fora do Kafka
+via Sink Connector); aqui o Databricks lê os 20 tópicos **diretamente** via
+Structured Streaming (`source_mode=kafka`) ou via o snapshot na Volume
+(`source_mode=volume`) — ver `kb/medallion.md`. `order_items` (110k registros,
+85% do volume) não tem um conector dedicado; tem um override de
+`maxOffsetsPerTrigger` (`MAX_OFFSETS_OVERRIDES = {"order_items": 5000}` em
+`pipelines/ubereats_pipeline.py`, ADR-08) em vez do `DEFAULT_MAX_OFFSETS=1000`
+usado pelos outros 19 domínios.
 
 ## Configurações críticas do conector Debezium
 

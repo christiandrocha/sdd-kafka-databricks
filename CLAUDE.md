@@ -39,6 +39,34 @@ Debezium envelope — there is no unwrap step in Silver. Topology is
 unidirectional (JSON exports → Postgres → Debezium → Kafka), so the
 audit-trail argument for skipping the SMT does not apply here. See ADR-02.
 
+**DELETE is not propagated as a delete — confirmed NULL-corruption gap, no ADR yet**
+Verified live against the local stack (2026-06-20): no table sets `REPLICA
+IDENTITY FULL`, so Postgres only logs primary-key columns in the before-image
+of an `UPDATE`/`DELETE` (confirmed via Debezium's own connection log: `"REPLICA
+IDENTITY for 'public.payments' is 'DEFAULT'; UPDATE and DELETE events will
+contain previous values only for PK columns"`). With
+`delete.handling.mode=rewrite`, a deleted row's rewritten Kafka record therefore
+has the merge key populated and **every other field `NULL`** (plus
+`__deleted="true"`, confirmed present in the registered Avro schema). Nothing
+in `register_silver()` filters on `__op`/`__deleted` for the 10 generic Silver
+domains, so this record flows straight into `create_auto_cdc_flow()` — which,
+lacking an `apply_as_deletes` condition, applies it as a normal
+`WHEN MATCHED THEN UPDATE SET *`. **Net effect: a Postgres `DELETE` does not
+remove the row from Silver/Gold — it overwrites every non-key column of the
+existing row with `NULL`, permanently, and the row stays visible everywhere
+downstream.** `users` takes a different, less destructive path:
+`_prepped_users()` filters `__op != 'd'` before the join, so the delete-rewrite
+row itself is dropped — but since `silver.users` is a full batch recompute over
+an append-only Bronze table, the user's last live state before deletion
+persists forever instead (stale, not corrupted). This has never been observed
+in a real pipeline run because `tests/load_to_postgres.py` only does
+`INSERT ... ON CONFLICT DO UPDATE` — no `DELETE` exists anywhere in this
+project's load harness, so the path is real but unexercised. See
+`.claude/kb/anti-patterns.md` (C08) for the full trace. Needs a `/design`
+decision: either set `REPLICA IDENTITY FULL` + pass `apply_as_deletes` to
+`create_auto_cdc_flow()`, or filter `__deleted='true'` into quarantine — no fix
+applied yet, this is a documented-but-open gap.
+
 **One Lakeflow pipeline for everything, all 3 targets (v1.2.0)**
 `pipelines/ubereats_pipeline.py` (renamed from `bronze_silver_dlt.py`) loops
 over `contracts/*.yml` and registers one `@dp.table` per Bronze domain (20)
