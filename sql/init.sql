@@ -424,6 +424,39 @@ CREATE INDEX IF NOT EXISTS idx_inventory_restaurant_id ON inventory (restaurant_
 CREATE INDEX IF NOT EXISTS idx_inventory_product_id    ON inventory (product_id);
 
 -- ════════════════════════════════════════════════════════════════════════════
+-- REPLICA IDENTITY FULL on all 20 tables — required for correct DELETE
+-- propagation (DESIGN_DELETE_HANDLING.md Decision 1). Without this, Postgres's
+-- default REPLICA IDENTITY only logs the primary key in a DELETE's
+-- before-image; every other column arrives NULL in Kafka, which either gets
+-- swallowed by an unrelated quarantine quality-rule (every one of the 10
+-- generic Silver domains has at least one) or — for users_mongo/users_mssql,
+-- whose join key `cpf` is not the Postgres PK `uuid` — breaks cpf_key
+-- derivation entirely. FULL makes every column survive into the delete event,
+-- so create_auto_cdc_flow's apply_as_deletes can act on real data instead of
+-- NULLs. See kb/anti-patterns.md (C08) and CLAUDE.md for the original gap.
+-- ════════════════════════════════════════════════════════════════════════════
+ALTER TABLE payment_events   REPLICA IDENTITY FULL;
+ALTER TABLE orders           REPLICA IDENTITY FULL;
+ALTER TABLE payments         REPLICA IDENTITY FULL;
+ALTER TABLE order_items      REPLICA IDENTITY FULL;
+ALTER TABLE gps_events       REPLICA IDENTITY FULL;
+ALTER TABLE order_status     REPLICA IDENTITY FULL;
+ALTER TABLE routes           REPLICA IDENTITY FULL;
+ALTER TABLE receipts         REPLICA IDENTITY FULL;
+ALTER TABLE driver_shifts    REPLICA IDENTITY FULL;
+ALTER TABLE search_events    REPLICA IDENTITY FULL;
+ALTER TABLE recommendations  REPLICA IDENTITY FULL;
+ALTER TABLE support_tickets  REPLICA IDENTITY FULL;
+ALTER TABLE users_mongo      REPLICA IDENTITY FULL;
+ALTER TABLE users_mssql      REPLICA IDENTITY FULL;
+ALTER TABLE restaurants      REPLICA IDENTITY FULL;
+ALTER TABLE drivers          REPLICA IDENTITY FULL;
+ALTER TABLE products         REPLICA IDENTITY FULL;
+ALTER TABLE menu_sections    REPLICA IDENTITY FULL;
+ALTER TABLE ratings          REPLICA IDENTITY FULL;
+ALTER TABLE inventory        REPLICA IDENTITY FULL;
+
+-- ════════════════════════════════════════════════════════════════════════════
 -- Publication for Debezium CDC — FOR ALL TABLES covers all 20 domains above
 -- and any future table without editing this publication (DESIGN Decision 1/2).
 -- connectors/debezium.json.table.include.list still needs the explicit table

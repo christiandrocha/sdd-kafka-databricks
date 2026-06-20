@@ -37,7 +37,7 @@ jobs:
       - name: yamllint contracts
         run: yamllint contracts/
 
-  test-contracts:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,17 +46,27 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install pyyaml pytest pydantic
+      # Runs every tests/test_*.py — previously only test_contracts.py ran here,
+      # so test_dlt_adapter.py never executed in CI despite existing in the repo.
       - name: pytest
-        run: pytest tests/test_contracts.py -v
+        run: pytest tests/ -v
 
   bundle-validate:
-    needs: [env-guard, lint, test-contracts]
+    needs: [env-guard, lint, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: databricks/setup-cli@main
-      - name: databricks bundle validate
+      - name: databricks bundle validate (dev)
         run: databricks bundle validate --target dev
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      # PIPELINE_UNIFICATION: free_edition's resource shape (1 pipeline + 1-task Job,
+      # same as dev/prod) changed the most of the 3 targets — validate it explicitly
+      # instead of relying on dev's validation to catch free_edition-only breakage.
+      - name: databricks bundle validate (free_edition)
+        run: databricks bundle validate --target free_edition
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}

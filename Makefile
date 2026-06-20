@@ -1,4 +1,4 @@
-.PHONY: up down register-connectors produce-initial produce-incremental dry-run lint test bundle-validate deploy-dev deploy-prod
+.PHONY: up down register-connectors produce-initial produce-incremental dry-run lint test security precommit-install bundle-validate deploy-dev deploy-prod
 
 # Infrastructure
 up:
@@ -26,7 +26,13 @@ lint:
 	yamllint contracts/
 
 test:
-	pytest tests/test_contracts.py -v
+	pytest tests/ -v
+
+security:
+	bandit -r contracts/ pipelines/ tests/ scripts/ -ll --skip B101,B608
+
+precommit-install:
+	pre-commit install
 
 # Databricks
 bundle-validate:

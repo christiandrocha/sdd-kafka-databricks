@@ -1,62 +1,14 @@
-# Databricks Knowledge Base
-# sdd-kafka-databricks specific patterns
-
-## Structured Streaming patterns
-
-### Reading from Kafka with Avro + Schema Registry
-```python
-df = spark.readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", kafka_bootstrap) \
-    .option("subscribe", kafka_topic) \
-    .option("startingOffsets", starting_offsets) \
-    .option("maxOffsetsPerTrigger", max_offsets) \
-    .load()
-
-# Parse Avro with Schema Registry (schema ID embedded in wire format)
-from pyspark.sql.functions import from_avro
-parsed = df.select(
-    from_avro(
-        col("value"),
-        options={"schemaRegistryAddress": schema_registry_url}
-    ).alias("data"),
-    col("offset").alias("_kafka_offset"),
-    col("timestamp").alias("_kafka_timestamp")
-)
-```
-
-### trigger(availableNow=True) — scales to zero
-```python
-query = df.writeStream \
-    .format("delta") \
-    .outputMode("append") \
-    .option("checkpointLocation", checkpoint_path) \
-    .trigger(availableNow=True) \
-    .toTable(table_name)
-query.awaitTermination()
-```
-
-### MERGE INTO with foreachBatch
-```python
-def merge_to_silver(df_batch, batch_id):
-    df_batch = df_batch.withColumn("_processed_at", current_timestamp())
-    df_batch.createOrReplaceTempView("staging")
-    spark.sql(f"""
-        MERGE INTO {silver_table} AS target
-        USING staging AS source
-        ON target.{merge_key} = source.{merge_key}
-        WHEN MATCHED AND source._source_ts_ms > target._source_ts_ms
-            THEN UPDATE SET *
-        WHEN NOT MATCHED
-            THEN INSERT *
-    """)
-
-df.writeStream \
-    .foreachBatch(merge_to_silver) \
-    .option("checkpointLocation", checkpoint_path) \
-    .trigger(availableNow=True) \
-    .start()
-```
+# KB: Databricks — sdd-kafka-databricks specific patterns
+# Corrected 2026-06-20: this file described the pre-v1.2.0 architecture (2
+# parametrized notebooks, hand-written MERGE INTO via foreachBatch, per-domain
+# DABs job tasks, dbutils.widgets). None of that exists anymore — v1.2.0
+# retired all 8 notebooks into one Lakeflow Declarative Pipeline
+# (pipelines/ubereats_pipeline.py) using create_auto_cdc_flow(), and
+# databricks.yml collapsed to one pipeline + one 1-task Job, identical across
+# all 3 targets. See kb/medallion.md (Bronze/Silver/Gold/CDC patterns) and
+# kb/schema-registry.md (Kafka+Avro ingestion) for what replaced the content
+# that used to be here — this file now covers only DABs/Unity
+# Catalog/Liquid-Clustering infrastructure specifics not covered there.
 
 ## Liquid Clustering
 
@@ -73,54 +25,72 @@ spark.sql(f"""
     )
 """)
 ```
+In practice, every table's `cluster_by`/`TBLPROPERTIES` are declared in its
+contract (`contracts/*.yml`'s `storage:` block) and translated by
+`contracts/spark_schema.py`'s `to_tblproperties()` — not written ad hoc per
+table the way this snippet implies. Use the contract, not a raw `CREATE TABLE`.
 
-### Critical: cluster_by MUST match MERGE ON (ADR-04)
+### Critical: cluster_by MUST match merge_key (ADR-04)
 ```
-silver.payment_events: cluster_by=[event_id, event_ts]  MERGE ON event_id  ✅
-silver.users:          cluster_by=[cpf]                  MERGE ON cpf       ✅
-gold.payment_lifecycle: cluster_by=[payment_id]          MERGE ON payment_id ✅
+silver.payment_events: cluster_by=[event_id]   merge_key=event_id   ✅
+silver.users:          cluster_by=[cpf]        merge_key=cpf        ✅
+silver.drivers:        cluster_by=[uuid]       merge_key=uuid       ✅
 ```
+Enforced by `tests/test_contracts.py::test_06_merge_key_in_cluster_by` — a
+contract that violates this fails CI, not just a runtime surprise.
 
-## Databricks Asset Bundles (DABs)
+## Databricks Asset Bundles (DABs) — real structure (v1.2.0)
 
-### databricks.yml structure
+`databricks.yml` is **one pipeline + one 1-task Job, identical across `dev`,
+`prod`, and `free_edition`** — not three different resource shapes. DABs has
+no way to exclude a root-level resource from a single target
+([databricks/cli#2872](https://github.com/databricks/cli/issues/2872)), so
+each target still declares its own `resources.pipelines.ubereats_pipeline`/
+`resources.jobs.ubereats_pipeline`, but both are aliases of one shared YAML
+anchor pair:
+
 ```yaml
-bundle:
-  name: sdd-kafka-databricks
+variables:
+  _pipeline_anchors:
+    default:
+      pipeline_resource: &pipeline_resource
+        name: ubereats_pipeline
+        catalog: ${var.catalog}
+        serverless: true            # Free Edition workspace — no job_clusters anywhere
+        libraries:
+          - file: { path: pipelines/ubereats_pipeline.py }
+        configuration:
+          ubereats.catalog: ${var.catalog}
+          ubereats.source_mode: ${var.bronze_source_mode}
+          bundle.files.path: ${workspace.file_path}
+
+      pipeline_task: &pipeline_task
+        task_key: ubereats_pipeline_task
+        pipeline_task:
+          pipeline_id: ${resources.pipelines.ubereats_pipeline.id}
 
 targets:
   dev:
-    mode: development
-    variables:
-      catalog: ubereats_dev
-      checkpoint_base: /Volumes/ubereats_dev/checkpoints
-
-  prod:
-    mode: production
-    variables:
-      catalog: ubereats_prod
-      checkpoint_base: /Volumes/ubereats_prod/checkpoints
-
-resources:
-  jobs:
-    sdd_kafka_pipeline:
-      name: sdd-kafka-databricks-pipeline
-      tasks:
-        - task_key: bronze_payment_events
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: payment_events
-              kafka_topic: pg.public.payment_events
-              bronze_table: "{{var.catalog}}.bronze.payment_events"
-              max_offsets: "1000"
+    variables: { catalog: ubereats_dev, bronze_source_mode: volume }
+    resources:
+      pipelines: { ubereats_pipeline: { <<: *pipeline_resource } }
+      jobs: { ubereats_pipeline: { tasks: [*pipeline_task] } }
+  # prod / free_edition: same shape, different `variables:` only
 ```
+
+Targets differ **only** by `variables:` (`catalog`, `bronze_source_mode`,
+`landing_base`) — never by resource shape or task count. There is no per-domain
+task anymore (the old shape was a 20+ task Job, one notebook task per domain);
+the entire 37-table DAG (20 Bronze + 11 Silver/quarantine pairs + 6 Gold) is
+one `pipeline_task` pointing at one Lakeflow pipeline. See
+`docs/adr/007_pipeline_unification.md`.
 
 ## Unity Catalog
 
 ### Namespace: catalog.schema.table
 ```python
-# Always use fully qualified names
+# Always use fully qualified names — every table reference in
+# pipelines/ubereats_pipeline.py is built this way, never a bare table name
 full_table = f"{catalog}.{schema}.{table_name}"
 # Examples:
 # ubereats_dev.bronze.payment_events
@@ -136,39 +106,34 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.silver")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.gold")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.quarantine")
 ```
-
-## Widgets pattern (parametrized notebooks)
-```python
-# Always provide defaults valid for dev environment
-dbutils.widgets.text("table_name",      "payment_events")
-dbutils.widgets.text("catalog",         "ubereats_dev")
-dbutils.widgets.text("kafka_bootstrap", "localhost:9092")
-dbutils.widgets.text("max_offsets",     "1000")
-
-# Read all widgets at the top
-TABLE_NAME  = dbutils.widgets.get("table_name")
-CATALOG     = dbutils.widgets.get("catalog")
-```
+Done by `scripts/preflight_unity_catalog.sh`, not inline in the pipeline —
+`pipelines/ubereats_pipeline.py` assumes the catalog/schemas already exist.
 
 ## JSONB fields (payment_events.event, order_status.status)
-These JSONB columns arrive as escaped JSON strings in the Avro payload.
-Direct path traversal fails. Use get_json_object or from_json:
+
+These columns arrive as escaped JSON strings in the Avro payload (verified
+against `contracts/payment_events.yml`/`contracts/order_status.yml` — both
+declare `type: string`, not a struct). Direct path traversal fails; use
+`get_json_object`:
 
 ```python
-from pyspark.sql.functions import get_json_object, col
+from pyspark.sql.functions import get_json_object, coalesce, col
 
-df = df.withColumn("event_name",
-    get_json_object(col("data.event"), "$.event_name"))
-df = df.withColumn("event_ts",
-    get_json_object(col("data.event"), "$.timestamp").cast("long"))
+# Real usage, register_gold_payment_funnel() / register_gold_payment_lifecycle()
+# in pipelines/ubereats_pipeline.py:
+df = df.withColumn(
+    "event_name",
+    coalesce(get_json_object(col("event"), "$.event_name"), col("event")),
+)
 ```
+The `coalesce(..., col("event"))` fallback matters — not every row's `event`
+field is JSON-shaped; falling back to the raw string avoids turning a parse
+miss into a silent `NULL`.
 
 ## Anti-patterns
 
-| Never do | Why | Instead |
-|---|---|---|
-| Read Bronze in Gold notebooks | Violates medallion lineage | Always read Silver |
-| Hardcode catalog name | Breaks dev/prod parity | Use widget + DABs variable |
-| cluster_by ≠ merge_key | Full table scan on MERGE | Align them (ADR-04) |
-| 60 static notebooks | DRY violation | 2 parametrized via DABs |
-| trigger(continuous=True) | Always-on cluster cost | trigger(availableNow=True) |
+See `kb/anti-patterns.md` for the full, severity-ranked list (this file used
+to keep its own separate table — consolidated there to avoid two copies
+drifting apart). The two items most specific to this file's topics are C01
+(Gold's full-recompute "scan" is intentional, don't add a `WHERE`) and H02
+(Liquid Clustering, not partitioning — `cluster_by` must equal `merge_key`).

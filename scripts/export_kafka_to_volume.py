@@ -2,8 +2,9 @@
 """Export the pg.public.* Kafka topics (post-SMT) to local Parquet, one
 directory per domain, casting fields to the types declared in contracts/*.yml.
 
-Output feeds pipeline_bronze.ipynb's source_mode=volume path (Free Edition,
-where the serverless compute can't reach a self-hosted Kafka broker).
+Output feeds pipelines/ubereats_pipeline.py's register_bronze() source_mode=volume
+path (Free Edition, where the serverless compute may not reach a self-hosted
+Kafka broker).
 Upload the result to the landing.kafka_export Volume with `databricks fs cp`.
 """
 from __future__ import annotations
@@ -29,7 +30,7 @@ _PYARROW_TYPE_MAP: dict[str, pa.DataType] = {
     "long": pa.int64(),
     "double": pa.float64(),
     "boolean": pa.bool_(),
-    "timestamp": pa.timestamp("ms"),
+    "timestamp": pa.timestamp("ms", tz="UTC"),
     "date": pa.date32(),
 }
 

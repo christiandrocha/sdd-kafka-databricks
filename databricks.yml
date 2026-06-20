@@ -1,21 +1,38 @@
-# Databricks Asset Bundle — sdd-kafka-databricks v1.1.0
+# Databricks Asset Bundle — sdd-kafka-databricks v1.2.0
 # Pipeline: JSON exports → PostgreSQL → Debezium → Kafka → Databricks → Unity Catalog
 # Platform: Uber Eats food delivery (Brazilian market)
 # Targets: ubereats_dev (development) / ubereats_prod (production) / free_edition (serverless)
-# Tasks: 37 total — 20 Bronze + 10 Silver + 1 Users + 6 Gold
 #
-# Compute: dev/prod use a classic job cluster (job_cluster_key); free_edition uses
-# serverless (no job_clusters at all — Free Edition doesn't support custom compute).
+# PIPELINE_UNIFICATION (v1.2.0): all 3 targets now run the SAME single Lakeflow Declarative
+# Pipeline (resources.pipelines.ubereats_pipeline, see pipelines/ubereats_pipeline.py) and
+# the SAME 1-task Job (resources.jobs.ubereats_pipeline) — Bronze (20 domains), Silver (10
+# generic + silver_users), Quarantine (11), and Gold (6), 37 tables total, one DAG. This
+# supersedes ADR-006's "Explicitly NOT migrated" section (Gold, silver_users, free_edition)
+# and the free_edition-specific Kafka-reachability premise informally cited elsewhere as
+# "ADR-05" — see docs/adr/007_pipeline_unification.md. The Job exists only because a
+# standalone pipeline resource has no native schedule — it carries exactly one
+# pipeline_task, kept for scheduling + email_notifications on failure.
+#
+# Targets differ only by `variables:` (catalog, bronze_source_mode, landing_base) — not by
+# code or resource shape. bronze_source_mode picks the branch pipelines/ubereats_pipeline.py's
+# register_bronze() takes: "volume" (spark.read batch off the landing Volume — the correct,
+# permanent mode for dev/free_edition in this project, not a temporary workaround: Databricks
+# serverless compute cannot reach the self-hosted Kafka broker from either target) or "kafka"
+# (spark.readStream — prod's target mode, once Kafka runs on infrastructure Databricks can
+# actually reach; not yet the case, so prod uses it as a documented future state, not current
+# behavior). See docs/adr/007_pipeline_unification.md for the decision record.
+#
+# Compute: the real workspace behind dev/prod/free_edition is a Free Edition account, which
+# only supports serverless compute — no job_clusters/job_cluster_key anywhere in this file.
 # DABs has no way to exclude a root-level resource from a single target
-# (https://github.com/databricks/cli/issues/2872), so each job lives entirely inside
-# its target's own `resources:` block. The 37 tasks are defined once as YAML anchors
-# and reused by both job bodies via merge keys — see `classic_tasks`/`serverless_tasks`
-# below. The anchors live under `variables._pipeline_anchors.default` (rather than as
-# root-level fields) because the DABs schema validator warns on unrecognized
-# top-level fields — `variables.<name>.default` accepts arbitrary YAML/JSON, so it's
-# the only schema-sanctioned home for anchor-only scaffolding. This variable is never
-# referenced as `${var._pipeline_anchors}`; only the YAML anchors defined inside its
-# `default:` value are used, via `<<: *anchor` merge keys and `*anchor` aliases.
+# (https://github.com/databricks/cli/issues/2872), so each target still declares its own
+# resources.pipelines.ubereats_pipeline / resources.jobs.ubereats_pipeline — both are now
+# identical aliases of the same anchor, not three different shapes. The anchors live under
+# variables._pipeline_anchors.default (rather than as root-level fields) because the DABs
+# schema validator warns on unrecognized top-level fields — variables.<name>.default accepts
+# arbitrary YAML/JSON, so it's the only schema-sanctioned home for anchor-only scaffolding.
+# This variable is never referenced as ${var._pipeline_anchors}; only the YAML anchors
+# defined inside its default: value are used, via <<: *anchor merge keys and *anchor aliases.
 
 bundle:
   name: sdd-kafka-databricks
@@ -25,779 +42,43 @@ workspace:
 
 variables:
   _pipeline_anchors:
-    description: "Internal scaffold (not a real input) holding YAML anchors for the 37 task definitions, job cluster spec, and email notification block, reused via merge keys/aliases elsewhere in this file."
+    description: "Internal scaffold (not a real input) holding YAML anchors for the single pipeline resource, its 1-task Job, and the shared email notification block, reused via merge keys/aliases elsewhere in this file."
     default:
-      task_definitions:
-        bronze_payment_events: &bronze_payment_events_task
-          task_key: bronze_payment_events
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: payment_events
-              kafka_topic: pg.public.payment_events
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.payment_events
-              checkpoint_path: ${var.checkpoint_base}/bronze/payment_events
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/payment_events.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/payment_events
+      pipeline_resource: &pipeline_resource
+        name: ubereats_pipeline
+        catalog: ${var.catalog}
+        # Unity Catalog requires exactly one of schema/target — this pipeline never relies
+        # on it since every @dp.table name in ubereats_pipeline.py is already
+        # fully-qualified (bronze/silver/quarantine/gold), so the value here is unused.
+        schema: bronze
+        # The real workspace behind dev/prod/free_edition is a Free Edition account, which
+        # only supports serverless compute for Lakeflow pipelines.
+        serverless: true
+        continuous: false
+        libraries:
+          - file:
+              path: pipelines/ubereats_pipeline.py
+        configuration:
+          ubereats.catalog: ${var.catalog}
+          ubereats.kafka_bootstrap: ${var.kafka_bootstrap}
+          ubereats.schema_registry_url: ${var.schema_registry_url}
+          ubereats.starting_offsets: earliest
+          ubereats.source_mode: ${var.bronze_source_mode}
+          ubereats.volume_base: ${var.landing_base}
+          # pipelines/ubereats_pipeline.py reads this to sys.path.insert() and locate
+          # contracts/*.yml — Lakeflow pipeline execution has no __file__, so it can't
+          # derive its own source path the way a notebook or plain script could.
+          # ${workspace.file_path} is the DABs-native variable for "where this bundle's
+          # source files were synced" — it already resolves correctly per target
+          # (dev/prod/free_edition) without hand-reconstructing the .bundle/<name>/<target>
+          # path pattern here, including for prod's overridden workspace.root_path.
+          bundle.files.path: ${workspace.file_path}
 
-        bronze_gps_events: &bronze_gps_events_task
-          task_key: bronze_gps_events
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: gps_events
-              kafka_topic: pg.public.gps_events
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.gps_events
-              checkpoint_path: ${var.checkpoint_base}/bronze/gps_events
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/gps_events.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/gps_events
-
-        bronze_order_status: &bronze_order_status_task
-          task_key: bronze_order_status
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: order_status
-              kafka_topic: pg.public.order_status
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.order_status
-              checkpoint_path: ${var.checkpoint_base}/bronze/order_status
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/order_status.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/order_status
-
-        bronze_search_events: &bronze_search_events_task
-          task_key: bronze_search_events
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: search_events
-              kafka_topic: pg.public.search_events
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.search_events
-              checkpoint_path: ${var.checkpoint_base}/bronze/search_events
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/search_events.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/search_events
-
-        bronze_recommendations: &bronze_recommendations_task
-          task_key: bronze_recommendations
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: recommendations
-              kafka_topic: pg.public.recommendations
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.recommendations
-              checkpoint_path: ${var.checkpoint_base}/bronze/recommendations
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/recommendations.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/recommendations
-
-        bronze_order_items: &bronze_order_items_task
-          task_key: bronze_order_items
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: order_items
-              kafka_topic: pg.public.order_items
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.order_items
-              checkpoint_path: ${var.checkpoint_base}/bronze/order_items
-              max_offsets: "5000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/order_items.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/order_items
-
-        bronze_orders: &bronze_orders_task
-          task_key: bronze_orders
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: orders
-              kafka_topic: pg.public.orders
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.orders
-              checkpoint_path: ${var.checkpoint_base}/bronze/orders
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/orders.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/orders
-
-        bronze_payments: &bronze_payments_task
-          task_key: bronze_payments
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: payments
-              kafka_topic: pg.public.payments
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.payments
-              checkpoint_path: ${var.checkpoint_base}/bronze/payments
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/payments.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/payments
-
-        bronze_routes: &bronze_routes_task
-          task_key: bronze_routes
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: routes
-              kafka_topic: pg.public.routes
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.routes
-              checkpoint_path: ${var.checkpoint_base}/bronze/routes
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/routes.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/routes
-
-        bronze_receipts: &bronze_receipts_task
-          task_key: bronze_receipts
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: receipts
-              kafka_topic: pg.public.receipts
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.receipts
-              checkpoint_path: ${var.checkpoint_base}/bronze/receipts
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/receipts.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/receipts
-
-        bronze_driver_shifts: &bronze_driver_shifts_task
-          task_key: bronze_driver_shifts
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: driver_shifts
-              kafka_topic: pg.public.driver_shifts
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.driver_shifts
-              checkpoint_path: ${var.checkpoint_base}/bronze/driver_shifts
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/driver_shifts.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/driver_shifts
-
-        bronze_support_tickets: &bronze_support_tickets_task
-          task_key: bronze_support_tickets
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: support_tickets
-              kafka_topic: pg.public.support_tickets
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.support_tickets
-              checkpoint_path: ${var.checkpoint_base}/bronze/support_tickets
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/support_tickets.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/support_tickets
-
-        bronze_users_mongo: &bronze_users_mongo_task
-          task_key: bronze_users_mongo
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: users_mongo
-              kafka_topic: pg.public.users_mongo
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.users_mongo
-              checkpoint_path: ${var.checkpoint_base}/bronze/users_mongo
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/users_mongo.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/users_mongo
-
-        bronze_users_mssql: &bronze_users_mssql_task
-          task_key: bronze_users_mssql
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: users_mssql
-              kafka_topic: pg.public.users_mssql
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.users_mssql
-              checkpoint_path: ${var.checkpoint_base}/bronze/users_mssql
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/users_mssql.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/users_mssql
-
-        bronze_restaurants: &bronze_restaurants_task
-          task_key: bronze_restaurants
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: restaurants
-              kafka_topic: pg.public.restaurants
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.restaurants
-              checkpoint_path: ${var.checkpoint_base}/bronze/restaurants
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/restaurants.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/restaurants
-
-        bronze_drivers: &bronze_drivers_task
-          task_key: bronze_drivers
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: drivers
-              kafka_topic: pg.public.drivers
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.drivers
-              checkpoint_path: ${var.checkpoint_base}/bronze/drivers
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/drivers.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/drivers
-
-        bronze_products: &bronze_products_task
-          task_key: bronze_products
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: products
-              kafka_topic: pg.public.products
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.products
-              checkpoint_path: ${var.checkpoint_base}/bronze/products
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/products.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/products
-
-        bronze_menu_sections: &bronze_menu_sections_task
-          task_key: bronze_menu_sections
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: menu_sections
-              kafka_topic: pg.public.menu_sections
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.menu_sections
-              checkpoint_path: ${var.checkpoint_base}/bronze/menu_sections
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/menu_sections.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/menu_sections
-
-        bronze_ratings: &bronze_ratings_task
-          task_key: bronze_ratings
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: ratings
-              kafka_topic: pg.public.ratings
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.ratings
-              checkpoint_path: ${var.checkpoint_base}/bronze/ratings
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/ratings.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/ratings
-
-        bronze_inventory: &bronze_inventory_task
-          task_key: bronze_inventory
-          notebook_task:
-            notebook_path: notebooks/pipeline_bronze.ipynb
-            base_parameters:
-              table_name: inventory
-              kafka_topic: pg.public.inventory
-              kafka_bootstrap: ${var.kafka_bootstrap}
-              schema_registry_url: ${var.schema_registry_url}
-              bronze_table: ${var.catalog}.bronze.inventory
-              checkpoint_path: ${var.checkpoint_base}/bronze/inventory
-              max_offsets: "1000"
-              starting_offsets: earliest
-              contract_path: ${var.workspace_root}/contracts/inventory.yml
-              source_mode: ${var.bronze_source_mode}
-              volume_path: ${var.landing_base}/inventory
-
-        silver_payment_events: &silver_payment_events_task
-          task_key: silver_payment_events
-          depends_on:
-            - task_key: bronze_payment_events
-          notebook_task:
-            notebook_path: notebooks/pipeline_silver.ipynb
-            base_parameters:
-              table_name: payment_events
-              bronze_table: ${var.catalog}.bronze.payment_events
-              silver_table: ${var.catalog}.silver.payment_events
-              quarantine_table: ${var.catalog}.quarantine.payment_events
-              contract_path: ${var.workspace_root}/contracts/payment_events.yml
-              checkpoint_path: ${var.checkpoint_base}/silver/payment_events
-
-        silver_orders: &silver_orders_task
-          task_key: silver_orders
-          depends_on:
-            - task_key: bronze_orders
-          notebook_task:
-            notebook_path: notebooks/pipeline_silver.ipynb
-            base_parameters:
-              table_name: orders
-              bronze_table: ${var.catalog}.bronze.orders
-              silver_table: ${var.catalog}.silver.orders
-              quarantine_table: ${var.catalog}.quarantine.orders
-              contract_path: ${var.workspace_root}/contracts/orders.yml
-              checkpoint_path: ${var.checkpoint_base}/silver/orders
-
-        silver_payments: &silver_payments_task
-          task_key: silver_payments
-          depends_on:
-            - task_key: bronze_payments
-          notebook_task:
-            notebook_path: notebooks/pipeline_silver.ipynb
-            base_parameters:
-              table_name: payments
-              bronze_table: ${var.catalog}.bronze.payments
-              silver_table: ${var.catalog}.silver.payments
-              quarantine_table: ${var.catalog}.quarantine.payments
-              contract_path: ${var.workspace_root}/contracts/payments.yml
-              checkpoint_path: ${var.checkpoint_base}/silver/payments
-
-        silver_drivers: &silver_drivers_task
-          task_key: silver_drivers
-          depends_on:
-            - task_key: bronze_drivers
-          notebook_task:
-            notebook_path: notebooks/pipeline_silver.ipynb
-            base_parameters:
-              table_name: drivers
-              bronze_table: ${var.catalog}.bronze.drivers
-              silver_table: ${var.catalog}.silver.drivers
-              quarantine_table: ${var.catalog}.quarantine.drivers
-              contract_path: ${var.workspace_root}/contracts/drivers.yml
-              checkpoint_path: ${var.checkpoint_base}/silver/drivers
-
-        silver_order_items: &silver_order_items_task
-          task_key: silver_order_items
-          depends_on:
-            - task_key: bronze_order_items
-          notebook_task:
-            notebook_path: notebooks/pipeline_silver.ipynb
-            base_parameters:
-              table_name: order_items
-              bronze_table: ${var.catalog}.bronze.order_items
-              silver_table: ${var.catalog}.silver.order_items
-              quarantine_table: ${var.catalog}.quarantine.order_items
-              contract_path: ${var.workspace_root}/contracts/order_items.yml
-              checkpoint_path: ${var.checkpoint_base}/silver/order_items
-
-        silver_driver_shifts: &silver_driver_shifts_task
-          task_key: silver_driver_shifts
-          depends_on:
-            - task_key: bronze_driver_shifts
-          notebook_task:
-            notebook_path: notebooks/pipeline_silver.ipynb
-            base_parameters:
-              table_name: driver_shifts
-              bronze_table: ${var.catalog}.bronze.driver_shifts
-              silver_table: ${var.catalog}.silver.driver_shifts
-              quarantine_table: ${var.catalog}.quarantine.driver_shifts
-              contract_path: ${var.workspace_root}/contracts/driver_shifts.yml
-              checkpoint_path: ${var.checkpoint_base}/silver/driver_shifts
-
-        silver_restaurants: &silver_restaurants_task
-          task_key: silver_restaurants
-          depends_on:
-            - task_key: bronze_restaurants
-          notebook_task:
-            notebook_path: notebooks/pipeline_silver.ipynb
-            base_parameters:
-              table_name: restaurants
-              bronze_table: ${var.catalog}.bronze.restaurants
-              silver_table: ${var.catalog}.silver.restaurants
-              quarantine_table: ${var.catalog}.quarantine.restaurants
-              contract_path: ${var.workspace_root}/contracts/restaurants.yml
-              checkpoint_path: ${var.checkpoint_base}/silver/restaurants
-
-        silver_order_status: &silver_order_status_task
-          task_key: silver_order_status
-          depends_on:
-            - task_key: bronze_order_status
-          notebook_task:
-            notebook_path: notebooks/pipeline_silver.ipynb
-            base_parameters:
-              table_name: order_status
-              bronze_table: ${var.catalog}.bronze.order_status
-              silver_table: ${var.catalog}.silver.order_status
-              quarantine_table: ${var.catalog}.quarantine.order_status
-              contract_path: ${var.workspace_root}/contracts/order_status.yml
-              checkpoint_path: ${var.checkpoint_base}/silver/order_status
-
-        silver_search_events: &silver_search_events_task
-          task_key: silver_search_events
-          depends_on:
-            - task_key: bronze_search_events
-          notebook_task:
-            notebook_path: notebooks/pipeline_silver.ipynb
-            base_parameters:
-              table_name: search_events
-              bronze_table: ${var.catalog}.bronze.search_events
-              silver_table: ${var.catalog}.silver.search_events
-              quarantine_table: ${var.catalog}.quarantine.search_events
-              contract_path: ${var.workspace_root}/contracts/search_events.yml
-              checkpoint_path: ${var.checkpoint_base}/silver/search_events
-
-        silver_recommendations: &silver_recommendations_task
-          task_key: silver_recommendations
-          depends_on:
-            - task_key: bronze_recommendations
-          notebook_task:
-            notebook_path: notebooks/pipeline_silver.ipynb
-            base_parameters:
-              table_name: recommendations
-              bronze_table: ${var.catalog}.bronze.recommendations
-              silver_table: ${var.catalog}.silver.recommendations
-              quarantine_table: ${var.catalog}.quarantine.recommendations
-              contract_path: ${var.workspace_root}/contracts/recommendations.yml
-              checkpoint_path: ${var.checkpoint_base}/silver/recommendations
-
-        silver_users: &silver_users_task
-          task_key: silver_users
-          depends_on:
-            - task_key: bronze_users_mongo
-            - task_key: bronze_users_mssql
-          notebook_task:
-            notebook_path: notebooks/pipeline_users.ipynb
-            base_parameters:
-              bronze_users_mongo: ${var.catalog}.bronze.users_mongo
-              bronze_users_mssql: ${var.catalog}.bronze.users_mssql
-              silver_users_table: ${var.catalog}.silver.users
-              quarantine_table: ${var.catalog}.quarantine.users
-
-        gold_payments_by_status: &gold_payments_by_status_task
-          task_key: gold_payments_by_status
-          depends_on:
-            - task_key: silver_payments
-          notebook_task:
-            notebook_path: notebooks/cross_domain/gold_payments_by_status.ipynb
-            base_parameters:
-              catalog: ${var.catalog}
-
-        gold_payment_funnel: &gold_payment_funnel_task
-          task_key: gold_payment_funnel
-          depends_on:
-            - task_key: silver_payment_events
-          notebook_task:
-            notebook_path: notebooks/cross_domain/gold_payment_funnel.ipynb
-            base_parameters:
-              catalog: ${var.catalog}
-
-        gold_payment_lifecycle: &gold_payment_lifecycle_task
-          task_key: gold_payment_lifecycle
-          depends_on:
-            - task_key: silver_payment_events
-          notebook_task:
-            notebook_path: notebooks/cross_domain/gold_payment_lifecycle.ipynb
-            base_parameters:
-              catalog: ${var.catalog}
-
-        gold_driver_performance: &gold_driver_performance_task
-          task_key: gold_driver_performance
-          depends_on:
-            - task_key: silver_driver_shifts
-            - task_key: silver_drivers
-            - task_key: silver_orders
-          notebook_task:
-            notebook_path: notebooks/cross_domain/gold_driver_performance.ipynb
-            base_parameters:
-              catalog: ${var.catalog}
-
-        gold_revenue_per_restaurant: &gold_revenue_per_restaurant_task
-          task_key: gold_revenue_per_restaurant
-          depends_on:
-            - task_key: silver_order_items
-            - task_key: silver_orders
-            - task_key: silver_restaurants
-          notebook_task:
-            notebook_path: notebooks/cross_domain/gold_revenue_per_restaurant.ipynb
-            base_parameters:
-              catalog: ${var.catalog}
-
-        gold_user_behavior: &gold_user_behavior_task
-          task_key: gold_user_behavior
-          depends_on:
-            - task_key: silver_search_events
-            - task_key: silver_recommendations
-            - task_key: silver_users
-          notebook_task:
-            notebook_path: notebooks/cross_domain/gold_user_behavior.ipynb
-            base_parameters:
-              catalog: ${var.catalog}
-
-      classic_job_clusters: &classic_job_clusters
-        - job_cluster_key: ubereats_cluster
-          new_cluster:
-            spark_version: 15.4.x-scala2.12
-            # node_type_id: Standard_DS3_v2    # Azure
-            # node_type_id: m5.xlarge          # AWS
-            # node_type_id: n1-standard-4      # GCP
-            node_type_id: Standard_DS3_v2
-            num_workers: 2
-            data_security_mode: SINGLE_USER
-            spark_conf:
-              spark.databricks.delta.preview.enabled: "true"
-              spark.databricks.delta.changeDataFeed.enabled: "true"
-
-      # All 37 tasks, classic compute — each anchor merged with job_cluster_key.
-      # Used by dev and prod (identical structure; only the `variables:` differ).
-      classic_tasks: &classic_tasks
-        - <<: *bronze_payment_events_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_gps_events_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_order_status_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_search_events_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_recommendations_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_order_items_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_orders_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_payments_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_routes_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_receipts_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_driver_shifts_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_support_tickets_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_users_mongo_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_users_mssql_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_restaurants_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_drivers_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_products_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_menu_sections_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_ratings_task
-          job_cluster_key: ubereats_cluster
-        - <<: *bronze_inventory_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_payment_events_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_orders_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_payments_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_drivers_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_order_items_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_driver_shifts_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_restaurants_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_order_status_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_search_events_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_recommendations_task
-          job_cluster_key: ubereats_cluster
-        - <<: *silver_users_task
-          job_cluster_key: ubereats_cluster
-        - <<: *gold_payments_by_status_task
-          job_cluster_key: ubereats_cluster
-        - <<: *gold_payment_funnel_task
-          job_cluster_key: ubereats_cluster
-        - <<: *gold_payment_lifecycle_task
-          job_cluster_key: ubereats_cluster
-        - <<: *gold_driver_performance_task
-          job_cluster_key: ubereats_cluster
-        - <<: *gold_revenue_per_restaurant_task
-          job_cluster_key: ubereats_cluster
-        - <<: *gold_user_behavior_task
-          job_cluster_key: ubereats_cluster
-
-      # Same 37 tasks, serverless compute — no job_cluster_key at all. Used only by
-      # the free_edition target. Unlike classic_tasks, this is NOT a flat list of
-      # aliases: depends_on is overridden per task to collapse the natural 3-tier
-      # fan-out (20 Bronze / 11 Silver / 6 Gold, all independent within their tier)
-      # into sequential batches of <=4. Free Edition serverless can't sustain that
-      # many concurrent Spark sessions — each layer's first batch is gated on the
-      # previous layer's last batch finishing entirely, so at most 4 tasks ever run
-      # at once. See ADR-06 addendum / .claude/05_implementation_log.md.
-      serverless_tasks: &serverless_tasks
-        # Bronze batch 1 — no upstream, starts immediately
-        - *bronze_payment_events_task
-        - *bronze_gps_events_task
-        - *bronze_order_status_task
-        - *bronze_search_events_task
-        # Bronze batch 2
-        - <<: *bronze_recommendations_task
-          depends_on: &bronze_b1
-            - task_key: bronze_payment_events
-            - task_key: bronze_gps_events
-            - task_key: bronze_order_status
-            - task_key: bronze_search_events
-        - <<: *bronze_order_items_task
-          depends_on: *bronze_b1
-        - <<: *bronze_orders_task
-          depends_on: *bronze_b1
-        - <<: *bronze_payments_task
-          depends_on: *bronze_b1
-        # Bronze batch 3
-        - <<: *bronze_routes_task
-          depends_on: &bronze_b2
-            - task_key: bronze_recommendations
-            - task_key: bronze_order_items
-            - task_key: bronze_orders
-            - task_key: bronze_payments
-        - <<: *bronze_receipts_task
-          depends_on: *bronze_b2
-        - <<: *bronze_driver_shifts_task
-          depends_on: *bronze_b2
-        - <<: *bronze_support_tickets_task
-          depends_on: *bronze_b2
-        # Bronze batch 4
-        - <<: *bronze_users_mongo_task
-          depends_on: &bronze_b3
-            - task_key: bronze_routes
-            - task_key: bronze_receipts
-            - task_key: bronze_driver_shifts
-            - task_key: bronze_support_tickets
-        - <<: *bronze_users_mssql_task
-          depends_on: *bronze_b3
-        - <<: *bronze_restaurants_task
-          depends_on: *bronze_b3
-        - <<: *bronze_drivers_task
-          depends_on: *bronze_b3
-        # Bronze batch 5
-        - <<: *bronze_products_task
-          depends_on: &bronze_b4
-            - task_key: bronze_users_mongo
-            - task_key: bronze_users_mssql
-            - task_key: bronze_restaurants
-            - task_key: bronze_drivers
-        - <<: *bronze_menu_sections_task
-          depends_on: *bronze_b4
-        - <<: *bronze_ratings_task
-          depends_on: *bronze_b4
-        - <<: *bronze_inventory_task
-          depends_on: *bronze_b4
-
-        # Silver batch 1 — gated on all Bronze finishing (last Bronze batch)
-        - <<: *silver_payment_events_task
-          depends_on: &bronze_b5
-            - task_key: bronze_products
-            - task_key: bronze_menu_sections
-            - task_key: bronze_ratings
-            - task_key: bronze_inventory
-        - <<: *silver_orders_task
-          depends_on: *bronze_b5
-        - <<: *silver_payments_task
-          depends_on: *bronze_b5
-        - <<: *silver_drivers_task
-          depends_on: *bronze_b5
-        # Silver batch 2
-        - <<: *silver_order_items_task
-          depends_on: &silver_b1
-            - task_key: silver_payment_events
-            - task_key: silver_orders
-            - task_key: silver_payments
-            - task_key: silver_drivers
-        - <<: *silver_driver_shifts_task
-          depends_on: *silver_b1
-        - <<: *silver_restaurants_task
-          depends_on: *silver_b1
-        - <<: *silver_order_status_task
-          depends_on: *silver_b1
-        # Silver batch 3
-        - <<: *silver_search_events_task
-          depends_on: &silver_b2
-            - task_key: silver_order_items
-            - task_key: silver_driver_shifts
-            - task_key: silver_restaurants
-            - task_key: silver_order_status
-        - <<: *silver_recommendations_task
-          depends_on: *silver_b2
-        - <<: *silver_users_task
-          depends_on: *silver_b2
-
-        # Gold batch 1 — gated on all Silver finishing (last Silver batch)
-        - <<: *gold_payments_by_status_task
-          depends_on: &silver_b3
-            - task_key: silver_search_events
-            - task_key: silver_recommendations
-            - task_key: silver_users
-        - <<: *gold_payment_funnel_task
-          depends_on: *silver_b3
-        - <<: *gold_payment_lifecycle_task
-          depends_on: *silver_b3
-        # Gold batch 2
-        - <<: *gold_driver_performance_task
-          depends_on: &gold_b1
-            - task_key: gold_payments_by_status
-            - task_key: gold_payment_funnel
-            - task_key: gold_payment_lifecycle
-        - <<: *gold_revenue_per_restaurant_task
-          depends_on: *gold_b1
-        - <<: *gold_user_behavior_task
-          depends_on: *gold_b1
+      pipeline_task: &pipeline_task
+        task_key: ubereats_pipeline_task
+        pipeline_task:
+          pipeline_id: ${resources.pipelines.ubereats_pipeline.id}
+          full_refresh: false
 
       email_notifications: &email_notifications
         on_failure:
@@ -807,18 +88,12 @@ variables:
   catalog:
     description: Unity Catalog name (ubereats_dev or ubereats_prod)
     default: ubereats_dev
-  checkpoint_base:
-    description: Base path for Structured Streaming checkpoints (Unity Catalog Volume)
-    default: /Volumes/ubereats_dev/checkpoints
   landing_base:
     description: Base path for the Kafka export Volume (Bronze source_mode=volume)
     default: /Volumes/ubereats_dev/landing/kafka_export
   bronze_source_mode:
-    description: "kafka (streaming, default) or volume (batch, Free Edition)"
-    default: kafka
-  workspace_root:
-    description: Absolute workspace path to deployed bundle source files — resolves contract YAML file paths at runtime
-    default: ${workspace.file_path}
+    description: "volume (batch off the landing Volume — correct/permanent for dev and free_edition) or kafka (streaming — prod's target mode once Kafka is reachable from Databricks)"
+    default: volume
   kafka_bootstrap:
     description: Kafka bootstrap servers
     default: localhost:9092
@@ -832,16 +107,22 @@ targets:
     default: true
     variables:
       catalog: ubereats_dev
-      checkpoint_base: /Volumes/ubereats_dev/checkpoints
       landing_base: /Volumes/ubereats_dev/landing/kafka_export
-      bronze_source_mode: kafka
+      # volume is permanent here, not a placeholder — dev runs on the same Databricks
+      # serverless compute as free_edition, which cannot reach the self-hosted Kafka
+      # broker. Populate the landing Volume first with scripts/export_kafka_to_volume.py.
+      bronze_source_mode: volume
     resources:
+      pipelines:
+        ubereats_pipeline:
+          <<: *pipeline_resource
       jobs:
         ubereats_pipeline:
           name: ubereats_pipeline
           email_notifications: *email_notifications
-          job_clusters: *classic_job_clusters
-          tasks: *classic_tasks
+          # No job_clusters — workspace only supports serverless, same as free_edition.
+          tasks:
+            - *pipeline_task
 
   prod:
     mode: production
@@ -849,32 +130,44 @@ targets:
       root_path: /Workspace/Users/christiandr@gmail.com/.bundle/${bundle.name}/${bundle.target}
     variables:
       catalog: ubereats_prod
-      checkpoint_base: /Volumes/ubereats_prod/checkpoints
       landing_base: /Volumes/ubereats_prod/landing/kafka_export
+      # kafka is prod's target mode, not its current verified state — it documents
+      # where prod is headed once Kafka runs on infrastructure Databricks can reach,
+      # not a confirmed-working deployment today. dev/free_edition use volume because
+      # that constraint is real for both right now.
       bronze_source_mode: kafka
     resources:
+      pipelines:
+        ubereats_pipeline:
+          <<: *pipeline_resource
       jobs:
         ubereats_pipeline:
           name: ubereats_pipeline
           email_notifications: *email_notifications
-          job_clusters: *classic_job_clusters
-          tasks: *classic_tasks
+          # No job_clusters — workspace only supports serverless, same as free_edition.
+          tasks:
+            - *pipeline_task
 
   free_edition:
     mode: development
     variables:
       catalog: ubereats_dev
-      checkpoint_base: /Volumes/ubereats_dev/checkpoints
       landing_base: /Volumes/ubereats_dev/landing/kafka_export
+      # Already correct, same reasoning as dev above — both run on Databricks
+      # serverless compute that cannot reach the self-hosted Kafka broker.
       bronze_source_mode: volume
     resources:
+      pipelines:
+        ubereats_pipeline:
+          <<: *pipeline_resource
       jobs:
         ubereats_pipeline:
           name: ubereats_pipeline
           max_concurrent_runs: 1
           email_notifications: *email_notifications
-          tasks: *serverless_tasks
-          # No job_clusters — Free Edition only supports serverless compute.
-          # max_concurrent_runs caps overlapping *runs* of this job; task-level
-          # concurrency within a single run is capped separately via depends_on
-          # batching in serverless_tasks above (max 4 tasks running at once).
+          # No job_clusters — Free Edition only supports serverless compute. The 37-task
+          # notebook job (PIPELINE_UNIFICATION's predecessor) is retired — this target now
+          # runs the same single pipeline_task as dev/prod, with bronze_source_mode=volume
+          # (same as dev — only prod targets kafka, and only once that mode is verified).
+          tasks:
+            - *pipeline_task

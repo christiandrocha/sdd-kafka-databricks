@@ -1,266 +1,158 @@
-# KB: CI/CD — GitHub Actions for dbt + Kafka Connect
-# Knowledge base for sdd-kafka-snowflake agents
+# KB: CI/CD — GitHub Actions for DABs + ruff/bandit
+# sdd-kafka-databricks specific — this file used to be a near-verbatim copy of
+# sdd-kafka-snowflake's CI/CD KB (dbt compile, Dagster restart, Snowflake
+# secrets). None of that exists in this project: there's no dbt, no Dagster,
+# and the deploy target is a Databricks Asset Bundle, not Snowflake/Dagster.
+# Corrected 2026-06-20.
 
-## Why CI/CD for a data pipeline project
+## Why CI/CD for this pipeline
 
-Without CI/CD, every change to connectors, dbt models or Dagster code
-requires a manual, error-prone deploy sequence. Common failures:
-- Committing .env with real credentials
-- Deploying malformed connector JSON that silently fails
-- dbt model with broken ref() that only fails at runtime
-- Deploying to prod without running dbt compile first
+Without it, every change to `contracts/*.yml` or `pipelines/ubereats_pipeline.py`
+needs a manual, error-prone deploy sequence. Failures this setup actually
+catches:
+- Committing `.env` with real credentials (`env-guard` job)
+- A contract YAML with a typo that breaks `load_contract()` or violates ADR-04
+  (`merge_key` not in `cluster_by`) — caught by `tests/test_contracts.py`
+- A `dlt_adapter.py` change that silently breaks expectation translation —
+  caught by `tests/test_dlt_adapter.py` (see `kb/data-quality.md` — this test
+  file existed but never ran in CI until 2026-06-20; fixed)
+- A `databricks.yml` change that's invalid for one target but not another —
+  caught by `databricks bundle validate` run separately per target
 
-CI validates before merge. CD automates after merge. Together they
-make the pipeline reproducible and auditable.
+CI validates before merge. CD deploys to `prod` automatically after CI passes
+on `main`. There is no dbt compile step and no Dagster restart anywhere in
+this project's real CI/CD.
 
-## Pipeline structure
+## Pipeline structure (matches .github/workflows/*.yml as of v1.2.0)
 
 ```
-Feature branch → PR opened
+Push to any branch / PR to main
     └─▶ ci.yml (GitHub Actions)
-            ├── dbt compile (syntax + ref() resolution, no Snowflake)
-            ├── connector JSON lint (valid JSON, required fields)
-            ├── .env guard (fails if .env is in the PR)
-            └── pre-commit checks (trailing whitespace, etc.)
+            ├── env-guard      — fails if .env is tracked by git
+            ├── lint           — ruff check . && yamllint contracts/
+            ├── test           — pytest tests/ -v (all tests/test_*.py)
+            └── bundle-validate (needs: env-guard, lint, test)
+                    ├── databricks bundle validate --target dev
+                    └── databricks bundle validate --target free_edition
+                        (validated separately — its resource shape changed the
+                        most of the 3 targets in the pipeline-unification work,
+                        docs/adr/007_pipeline_unification.md)
 
-PR merged to main
-    └─▶ deploy.yml (GitHub Actions)
-            ├── register_connectors.sh --env prod (GitHub Secrets → Snowflake)
-            └── dagster deploy (restart dagster + dagster-daemon)
+Push to main (after CI succeeds)
+    └─▶ deploy.yml (GitHub Actions, workflow_run trigger)
+            └── databricks bundle deploy --target prod
 ```
 
-## ci.yml structure
+`deploy.yml` never runs `bundle validate --target prod` itself — it relies on
+`ci.yml`'s `bundle-validate` job (dev + free_edition only) plus the
+`environment: production` GitHub approval gate. If you ever need to validate
+`prod` specifically in CI, add a third `bundle validate --target prod` step to
+`ci.yml`'s `bundle-validate` job — it isn't there today.
+
+## ci.yml (real, current)
 
 ```yaml
-name: CI
-on:
-  pull_request:
-    branches: [main]
-
 jobs:
-  validate:
-    runs-on: ubuntu-latest
+  env-guard:
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dbt
-        run: pip install dbt-core==1.7.* dbt-snowflake==1.7.*
-
-      - name: dbt deps
-        working-directory: dbt
-        run: dbt deps
-
-      - name: dbt compile (no Snowflake connection)
-        working-directory: dbt
-        run: dbt compile --profiles-dir .ci/profiles
-        # .ci/profiles/profiles.yml uses dummy Snowflake credentials
-        # dbt compile validates syntax and ref() without executing queries
-
-      - name: Lint connector JSONs
-        run: |
-          for f in connectors/*.json; do
-            python -m json.tool "$f" > /dev/null || exit 1
-          done
-
-      - name: Check .env not committed
-        run: |
-          if git diff --name-only origin/main...HEAD | grep -E '^\.env$'; then
-            echo "ERROR: .env file must not be committed"
+      - run: |
+          if git ls-files | grep -qE '^\.env$'; then
+            echo "ERROR: .env is tracked by git. Remove it: git rm --cached .env"
             exit 1
           fi
+
+  lint:
+    steps:
+      - run: pip install ruff yamllint
+      - run: ruff check .
+      - run: yamllint contracts/
+
+  test:
+    steps:
+      - run: pip install pyyaml pytest pydantic
+      - run: pytest tests/ -v
+
+  bundle-validate:
+    needs: [env-guard, lint, test]
+    steps:
+      - uses: databricks/setup-cli@main
+      - run: databricks bundle validate --target dev
+      - run: databricks bundle validate --target free_edition
 ```
 
-## deploy.yml structure
+## deploy.yml (real, current)
 
 ```yaml
-name: Deploy
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
     branches: [main]
+    types: [completed]
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
-    environment: production
+    if: github.event.workflow_run.conclusion == 'success'
+    environment: production   # GitHub Environment protection rule = manual approval gate
     steps:
       - uses: actions/checkout@v4
-
-      - name: Register Kafka connectors
-        env:
-          SNOWFLAKE_URL:         ${{ secrets.SNOWFLAKE_URL }}
-          SNOWFLAKE_USER:        ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
-          SNOWFLAKE_DATABASE:    ${{ secrets.SNOWFLAKE_DATABASE }}
-          SNOWFLAKE_ROLE:        ${{ secrets.SNOWFLAKE_ROLE }}
-          POSTGRES_USER:         ${{ secrets.POSTGRES_USER }}
-          POSTGRES_PASSWORD:     ${{ secrets.POSTGRES_PASSWORD }}
-        run: |
-          chmod +x scripts/register_connectors.sh
-          ./scripts/register_connectors.sh --env prod
-
-      - name: Restart Dagster
-        run: |
-          # In production, this would SSH to the server or call a deploy API
-          echo "Dagster deploy step — implement per production environment"
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: databricks/setup-cli@main
+      - run: databricks bundle deploy --target prod
 ```
 
-## CI-safe dbt profiles
+## Local pre-commit gate (.pre-commit-config.yaml, added 2026-06-20)
 
-dbt compile in CI does not need a real Snowflake connection.
-Use a dummy profiles file that satisfies dbt's schema validation:
+Runs the same `ruff` lint CI runs, plus `ruff-format`, basic file hygiene
+(trailing whitespace, large files, merge conflicts, private keys),
+`yamllint` on `contracts/`, and a `bandit` security scan — **none of this ran
+locally before this was added; only `ruff`/`yamllint` ran, and only in CI.**
 
-```yaml
-# infra/dbt/.ci/profiles/profiles.yml
-sdd_kafka_snowflake:
-  target: ci
-  outputs:
-    ci:
-      type: snowflake
-      account: ci-dummy
-      user: ci-dummy
-      password: ci-dummy
-      database: CDC_POC
-      warehouse: CDC_WH
-      schema: SILVER
-      threads: 1
-```
-
-dbt compile resolves ref() and source() without executing any SQL.
-Malformed Jinja, broken ref() and missing columns are caught here.
-
-## .gitignore for this project
-
-```
-# Credentials — never commit
-.env
-.env.*
-!.env.example
-
-# dbt build artifacts
-dbt/target/
-dbt/dbt_packages/
-dbt/logs/
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
-
-# Dagster
-dagster/dagster_home/
-
-# RSA keys
-rsa_key*.p8
-rsa_key*.pem
-
-# OS
-.DS_Store
-```
-
-## pre-commit configuration
-
-```yaml
-# .pre-commit-config.yaml
-repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
-    hooks:
-      - id: trailing-whitespace
-      - id: end-of-file-fixer
-      - id: check-json          # catches malformed connector JSONs
-      - id: check-yaml          # catches malformed YAML configs
-
-  - repo: https://github.com/Yelp/detect-secrets
-    rev: v1.4.0
-    hooks:
-      - id: detect-secrets      # blocks .env and credential patterns
-        args: ['--baseline', '.secrets.baseline']
-```
-
-Install and activate:
 ```bash
-pip install pre-commit detect-secrets
+pip install pre-commit   # or: make precommit-install after `pip install -e ".[dev]"`
 pre-commit install
-detect-secrets scan > .secrets.baseline
+pre-commit run --all-files
 ```
 
-## docker-compose.override.yml pattern
+## Makefile targets (real, current)
 
-Docker Compose loads `docker-compose.override.yml` automatically when
-both files are in the same directory. No flag needed for local dev.
-
-```yaml
-# docker-compose.override.yml — local only, not for production
-version: "3.8"
-
-services:
-  postgres:
-    ports:
-      - "5432:5432"   # exposed locally for psql access
-    volumes:
-      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
-
-  kafka:
-    ports:
-      - "9092:9092"   # exposed for local Kafka clients
-
-  kafka-connect:
-    ports:
-      - "8083:8083"
-
-  dagster:
-    volumes:
-      - ./dbt:/opt/dagster/dbt        # live reload dbt models in local
-      - ./dagster:/opt/dagster/app
-      - ./scripts:/opt/dagster/scripts  # sync_metadata.py accessible to Dagster
+```bash
+make lint               # ruff check . && yamllint contracts/
+make test                # pytest tests/ -v
+make security             # bandit -r contracts/ pipelines/ tests/ scripts/ -ll --skip B101,B608
+make precommit-install   # pre-commit install
+make bundle-validate     # databricks bundle validate --target dev
+make deploy-dev          # databricks bundle deploy --target dev
+make deploy-prod         # databricks bundle deploy --target prod
 ```
 
-## docker-compose.prod.yml — reference topology
+`deploy-dev`/`deploy-prod` are for manual/local use — the real `prod` deploy
+path in CI is `deploy.yml`, not someone running `make deploy-prod` by hand.
 
-```yaml
-# docker-compose.prod.yml — REFERENCE ONLY
-# In production:
-# - Kafka → Confluent Cloud or AWS MSK (remove zookeeper, kafka services)
-# - Schema Registry → Confluent Cloud (remove schema-registry service)
-# - Prometheus + Grafana → managed (Grafana Cloud, etc.)
-# - All services: restart: always, no exposed ports, secrets via vault
+## .gitignore (real, current — no dbt/Dagster entries)
 
-version: "3.8"
-
-services:
-  postgres:
-    restart: always
-    # No ports exposed — accessed via internal network only
-
-  kafka-connect:
-    restart: always
-    environment:
-      BOOTSTRAP_SERVERS: <confluent-cloud-bootstrap>:9092
-      # ...confluent cloud credentials via secrets manager
-
-  dagster:
-    restart: always
-
-  dagster-daemon:
-    restart: always
+```
+.env / .env.* (except .env.example)
+__pycache__/, *.pyc, .pytest_cache/, .ruff_cache/, .coverage
+.databricks/, bundle.lock
+*.pem, *.key, credentials.json
 ```
 
-## GitHub Secrets required for deploy.yml
+The `dbt (if added)` block in the real `.gitignore` (`target/`,
+`dbt_packages/`, `logs/`) is defensive boilerplate for a dbt project that
+doesn't exist here — this project uses Lakeflow Declarative Pipelines, not
+dbt, per `CLAUDE.md`'s "What changed from sdd-kafka-snowflake" table.
+
+## GitHub Secrets required
 
 Set in GitHub → Settings → Secrets and variables → Actions:
 
-| Secret name | Description |
+| Secret name | Used by |
 |---|---|
-| SNOWFLAKE_URL | `<account>.snowflakecomputing.com` |
-| SNOWFLAKE_USER | Snowflake service account user |
-| SNOWFLAKE_PRIVATE_KEY | Base64-encoded private key |
-| SNOWFLAKE_DATABASE | `CDC_POC` (or prod equivalent) |
-| SNOWFLAKE_ROLE | `CDC_ROLE` (or prod equivalent) |
-| POSTGRES_USER | PostgreSQL user |
-| POSTGRES_PASSWORD | PostgreSQL password |
+| `DATABRICKS_HOST` | `ci.yml`'s `bundle-validate`, `deploy.yml`'s `deploy` |
+| `DATABRICKS_TOKEN` | same as above |
+
+No Snowflake, no Postgres credentials needed in GitHub Secrets — `ci.yml`
+never connects to a live database; `tests/test_contracts.py`/
+`test_dlt_adapter.py` only parse local YAML, and `bundle validate` is a static
+check against `databricks.yml`, not a live deploy.

@@ -61,10 +61,39 @@ incremental (`source_ts_ms DESC` no ROW_NUMBER, `source_ts_ms > MAX(source_ts_ms
 
 ### delete.handling.mode=rewrite + drop.tombstones=false
 
-DELETEs não são descartados. O SMT os reescreve como eventos normais com `__op=d`
-no payload — o registro deleted chega no Kafka com seus valores e `__op=d`.
-Tombstones (mensagens com value=null) são mantidos (`drop.tombstones=false`).
-Os Silver models filtram `op != 'd'` para excluir DELETEs do estado atual.
+DELETEs não são descartados — o SMT os reescreve como eventos normais com `__op=d`
+no payload, em vez de emitir um tombstone. **Fix aplicado em 2026-06-20**
+(`DESIGN_DELETE_HANDLING.md`): todas as 20 tabelas agora definem `REPLICA
+IDENTITY FULL` (`sql/init.sql` + `scripts/migrate_replica_identity.sh` para
+instâncias já existentes) — antes disso, nenhuma tabela definia `FULL`, então
+o Postgres só logava a chave primária no before-image de um DELETE e todo o
+resto vinha `null` (confirmado ao vivo no log do Debezium:
+`"REPLICA IDENTITY for 'public.payments' is 'DEFAULT'; UPDATE and DELETE
+events will contain previous values only for PK columns"`). Com `FULL`,
+reverifiquei ao vivo pós-fix: o registro de delete agora chega com os mesmos
+valores reais do insert/update anterior (`method`, `status`, `amount`, etc.),
+não apenas a PK — + `__op=d` + `__deleted="true"` (presente no schema Avro
+desde a v1).
+
+Tombstones (mensagens com value=null) são mantidos (`drop.tombstones=false`),
+mas isso é irrelevante para o pipeline atual — `pipelines/ubereats_pipeline.py`
+nunca lê tombstones.
+
+**`register_silver()` (os 10 domínios genéricos) agora passa
+`apply_as_deletes=expr("__op = 'd'")` para `create_auto_cdc_flow()`** — o
+DELETE remove a linha de Silver em vez de zerar suas colunas. Isso só
+funciona porque `REPLICA IDENTITY FULL` garante que os campos não-chave não
+chegam `null` (campos `null` cairiam nas mesmas regras de quarentena que
+qualquer linha normal, e toda regra de quarentena nos 10 domínios genéricos
+está em um campo que não é a PK real — ver `DEFINE_DELETE_HANDLING.md`).
+`register_silver_users()` também foi ajustado: `_prepped_users()`/
+`_dedup_by_cpf()` agora deixam o evento de delete passar pelo dedup e só
+excluem o `cpf` se o evento mais recente for um delete — antes, o delete era
+descartado antes do dedup e o usuário ficava congelado no último estado vivo
+para sempre. **Ainda não verificado:** o comportamento real do
+`apply_as_deletes`/`full_refresh` num workspace Databricks de fato — sem
+acesso a um workspace nesta sessão. Ver `.claude/kb/anti-patterns.md` (C08) e
+`CLAUDE.md` para o mecanismo completo.
 
 ## Publication e replication slot
 
@@ -100,8 +129,15 @@ pg.public.drivers           pg.public.products       pg.public.menu_sections
 pg.public.ratings           pg.public.inventory
 ```
 
-20 tópicos no total. `order_items` vai para o conector `sinkitems` (buffer maior).
-Os outros 19 vão para o conector `sink`.
+20 tópicos no total. Não existe Kafka Sink Connector neste projeto — havia
+`sink`/`sinkitems` no `sdd-kafka-snowflake` (que empurrava para fora do Kafka
+via Sink Connector); aqui o Databricks lê os 20 tópicos **diretamente** via
+Structured Streaming (`source_mode=kafka`) ou via o snapshot na Volume
+(`source_mode=volume`) — ver `kb/medallion.md`. `order_items` (110k registros,
+85% do volume) não tem um conector dedicado; tem um override de
+`maxOffsetsPerTrigger` (`MAX_OFFSETS_OVERRIDES = {"order_items": 5000}` em
+`pipelines/ubereats_pipeline.py`, ADR-08) em vez do `DEFAULT_MAX_OFFSETS=1000`
+usado pelos outros 19 domínios.
 
 ## Configurações críticas do conector Debezium
 

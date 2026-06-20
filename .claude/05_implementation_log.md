@@ -975,3 +975,533 @@ JOIN; guard `row_number()` retrofitado nos 2 Gold que ainda não tinham.
   todo.
 
 ### Status: resolved
+
+## 2026-06-18 — LAKEFLOW_MIGRATION (v1.1.0): Bronze+Silver em Databricks Lakeflow
+
+### Implemented
+- `contracts/dlt_adapter.py` — traduz um contrato já carregado (`contracts/loader.py`) em
+  expectations/predicados DLT, sem alterar o formato `contracts/*.yml`:
+  `to_reject_expectations`, `to_warn_expectations`, `quarantine_row_level_predicate`,
+  `unique_check_fields`, `_condition_sql`.
+- `pipelines/bronze_silver_dlt.py` — `pyspark.pipelines as dp` (API atual, não o alias
+  legado `dlt`), loop sobre os 20 contratos: 1 `@dp.table` Bronze por domínio + 1 par
+  Silver/quarentena (10 de 11 domínios — `users_mongo`/`users_mssql` ficam só com Bronze,
+  ver Decisions) usando `dp.create_auto_cdc_flow` (renome de `apply_changes`) para o upsert
+  por `merge_key`, e um *stream-static join* dentro da tabela de quarentena para portar
+  `check: unique` (sem equivalente nativo em `@dp.expect`).
+- `databricks.yml` — novo `resources.pipelines.ubereats_bronze_silver` (dev/prod, dentro do
+  `resources:` de cada target, não na raiz — mesmo motivo do ADR-06 original,
+  [databricks/cli#2872](https://github.com/databricks/cli/issues/2872)); os 30 tasks
+  `bronze_*`/`silver_*` substituídos por 1 `pipeline_task` para dev/prod; `free_edition`
+  inalterado (ainda os 37 tasks originais).
+- `docs/adr/006_lakeflow_migration.md` — documenta a sobrescrita do escopo Bronze/Silver do
+  ADR-03, sem editar o ADR original.
+- `CLAUDE.md` — nova entrada de decisão, tabelas "Platform at a glance"/"What changed"
+  atualizadas, versão bumped para v1.1.0.
+- `tests/test_dlt_adapter.py` — 33 testes novos (parametrizados nos 20 contratos reais +
+  casos sintéticos para cada tipo de `check`/`on_failure`).
+
+### Problems encountered
+- 2 dos 12 contratos com `layers: [bronze, silver]` (`users_mongo`, `users_mssql`) não usam
+  o MERGE genérico de Silver hoje — alimentam o FULL OUTER JOIN bespoke de
+  `pipeline_users.ipynb`. O esboço do DESIGN não deixava essa exclusão explícita.
+  → Solução: `SILVER_EXCLUDED_DOMAINS = {"users_mongo", "users_mssql"}` no loop — ambos
+    continuam recebendo Bronze do novo pipeline, só pulam o par Silver/quarentena genérico.
+- `classic_tasks` (anchor de 37 entradas) ficou completamente sem uso depois que dev/prod
+  passaram a usar `lakeflow_tasks`.
+  → Solução: removido (YAML morto), comentários adjacentes atualizados.
+- `ruff check pipelines/bronze_silver_dlt.py` (caminho explícito) reporta `F821` para
+  `spark`/`dbutils` — globals injetados pelo runtime Databricks, ignorando o `exclude` do
+  `pyproject.toml`. `ruff check .` (sem caminho explícito) respeita o `exclude` normalmente.
+  → Solução: adicionado `pipelines` ao mesmo `exclude` que já protegia `notebooks` pelo
+    mesmo motivo — não um padrão novo, o mesmo já estabelecido.
+- `databricks bundle validate -t dev` falhou por OAuth refresh token expirado — mesma
+  limitação de ambiente das features anteriores (sem autenticação Databricks ao vivo neste
+  sandbox).
+  → Substituído por verificação estrutural via `yaml.safe_load` (anchors resolvem, contagem
+    de tasks, `depends_on` sem nenhum `task_key` `bronze_*`/`silver_*` órfão,
+    `free_edition` byte-a-byte idêntico antes/depois).
+
+### Decisions made during build
+- Todos os 6 arquivos do manifesto construídos diretamente, sem delegar a
+  `@lakeflow-pipeline-builder`/`@ci-cd-specialist`/`@data-quality-analyst` como o DESIGN
+  sugeria — as partes de maior risco exigiam manter o conteúdo completo dos arquivos
+  existentes e o raciocínio do DESIGN no mesmo contexto.
+- `MAX_OFFSETS_OVERRIDES = {"order_items": 5000}` adicionado no Python do pipeline (ADR-08),
+  já que o parâmetro por-task do DABs deixou de existir para os domínios migrados.
+
+### Verification
+- `python3 -m pytest -q` → 196 passed (163 → 196, 0 regressões).
+- `ruff check .` → All checks passed.
+- `python3 -c "import ast; ast.parse(...)"` em `pipelines/bronze_silver_dlt.py` → sintaxe OK
+  (não importável neste ambiente — `pyspark`/`pyspark.pipelines` não instalados, mesma
+  limitação que já existia para os notebooks).
+- `yaml.safe_load` em `databricks.yml` → parse OK; `free_edition` confirmado idêntico
+  antes/depois; `dev`/`prod` com 8 tasks cada, todos os 7 não-pipeline com
+  `depends_on: [bronze_silver_pipeline]`.
+- Validação live contra um workspace Databricks real (pipeline Lakeflow rodando de fato,
+  stream-static join de `check: unique`, `create_auto_cdc_flow`) **não executada** — mesma
+  limitação de ambiente já documentada em todas as features anteriores.
+
+### Open questions
+- Numeração de ADR ainda inconsistente (pré-existente, não criada por esta feature):
+  `docs/adr/006_lakeflow_migration.md` é o próximo número sequencial *dentro da pasta*
+  `docs/adr/`, mas não corresponde a nenhum "ADR-06" informal já mencionado em outro lugar
+  do projeto. Mesma mitigação já usada em `005_gold_dimension_join_integrity.md`:
+  referenciado em `CLAUDE.md` pelo caminho do arquivo, não por um número.
+- A4 (loop gerando múltiplas tabelas Lakeflow dinamicamente) e a parte de stream-static join
+  dentro de uma função `@dp.table` não foram confirmadas contra um workspace real — maior
+  risco técnico residual desta feature, registrado no BUILD_REPORT e no ADR.
+
+### Status: resolved
+
+---
+
+## 2026-06-19 — pipelines/ubereats_pipeline.py — `__file__` indisponível em contexto Lakeflow
+
+### Implemented
+- `pipelines/ubereats_pipeline.py` — substituídos os dois usos de
+  `Path(__file__).resolve().parent.parent` (linha do `sys.path.insert` e
+  `CONTRACTS_DIR`) por um único `BUNDLE_FILES_PATH = spark.conf.get("bundle.files.path", ...)`,
+  lido uma vez no topo do módulo.
+- `databricks.yml` — adicionada `bundle.files.path: ${workspace.file_path}` ao bloco
+  `configuration:` do anchor `pipeline_resource` compartilhado — uma única linha cobre
+  `dev`/`prod`/`free_edition` automaticamente, já que o anchor é o mesmo para os 3 targets.
+
+### Problems encountered
+- O usuário reportou (provavelmente a partir de uma tentativa real de deploy) que
+  `Path(__file__)` falha quando o Lakeflow executa um arquivo `.py` de pipeline — o runtime
+  não executa o arquivo como `python <path>` da forma que um notebook/script comum seria,
+  então `__file__` não fica definido nesse contexto.
+  → A correção pedida pelo usuário cobria só a linha do `sys.path.insert`; `CONTRACTS_DIR`
+    (linha 43) tinha o mesmo padrão e quebraria do mesmo jeito, uma linha depois — corrigido
+    junto, não só o que foi pedido literalmente.
+- O usuário sugeriu reconstruir o path manualmente com
+  `/Workspace/Users/.../.bundle/sdd-kafka-databricks/${bundle.target}/files`.
+  → Esse exato padrão já existia neste repositório como variável `workspace_root`
+    (default: `${workspace.file_path}`), removida no build anterior (PIPELINE_UNIFICATION)
+    por parecer não-usada após a deleção dos 8 notebooks legados — acabou sendo necessária
+    de novo, só que para o pipeline unificado, não para os notebooks.
+  → Solução: usado `${workspace.file_path}` (variável nativa do DABs) em vez de
+    reconstruir o path à mão — resolve corretamente por target sem hardcodar o padrão
+    `.bundle/<name>/<target>` duas vezes, e não quebra se `prod` algum dia tiver um
+    `workspace.root_path` que não siga esse padrão.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py` → sintaxe OK; `grep __file__` só
+  encontra o comentário explicativo, nenhum uso real restante.
+- `yaml.safe_load(databricks.yml)` → `bundle.files.path: ${workspace.file_path}` presente
+  na configuração resolvida dos 3 targets (`dev`/`prod`/`free_edition`).
+- `databricks bundle validate --target {dev,prod,free_edition}` → mesma limitação de
+  ambiente já registrada (token OAuth expirado), mas resolve a YAML/anchors corretamente
+  antes de falhar na autenticação — nenhuma regressão estrutural.
+- `ruff check .` → All checks passed.
+- `PYTHONPATH=. pytest tests/test_contracts.py tests/test_dlt_adapter.py -q` → 196 passed,
+  0 regressões (suite não afetada por esta mudança).
+
+### Open questions
+- Esta correção não foi confirmada contra um workspace real — mesma limitação de ambiente
+  de todas as features anteriores. Validação live continua pendente (ver
+  `.claude/sdd/archive/PIPELINE_UNIFICATION/SHIPPED_2026-06-19.md`, seção de
+  Recommendations).
+
+### Status: resolved
+
+---
+
+## 2026-06-19 — databricks.yml — volume é o modo permanente de dev/free_edition, não workaround temporário
+
+### Implemented
+- `databricks.yml` — `dev.bronze_source_mode` mudou de `kafka` para `volume` (permanente);
+  `prod.bronze_source_mode` permanece `kafka`, agora documentado explicitamente como modo
+  futuro/alvo, não estado atual confirmado; `free_edition.bronze_source_mode` permanece
+  `volume` (já correto). Default global da variável `bronze_source_mode` também mudou de
+  `kafka` para `volume`. Comentários do header e de cada target reescritos para refletir
+  que `volume` é o modo correto do projeto para `dev`/`free_edition`, não um contorno.
+- `docs/adr/007_pipeline_unification.md` — novo "Addendum (2026-06-19)" documentando a
+  decisão explicitamente: por que `volume` é permanente para `dev`/`free_edition` e por que
+  `kafka` em `prod` é aspiracional, não verificado.
+- `CLAUDE.md` — seção "Bronze has two source_modes" e o diagrama de estrutura do Unity
+  Catalog atualizados para a mesma framing (volume = padrão dev/free_edition; kafka =
+  alvo futuro só de prod).
+
+### Decisions made during build
+- O addendum foi adicionado dentro do `docs/adr/007_pipeline_unification.md` existente
+  (não um ADR-008 novo) — é um refinamento da mesma decisão de `source_mode` que o ADR-007
+  já cobre (a pergunta "qual modo é correto por target" estava deliberadamente aberta ali),
+  não a reversão de uma decisão já assentada. Convenção de ADR append-only deste projeto
+  preservada via seção datada separada, não reescrevendo o corpo original do ADR-007.
+
+### Verification
+- `yaml.safe_load(databricks.yml)` → `dev`/`free_edition` = `volume`, `prod` = `kafka`.
+- `databricks bundle validate --target {dev,prod,free_edition}` → mesma limitação de
+  ambiente já registrada (token OAuth expirado), resolve YAML/anchors corretamente antes de
+  falhar na autenticação.
+- `ruff check .` → All checks passed.
+- `PYTHONPATH=. pytest tests/test_contracts.py tests/test_dlt_adapter.py -q` → 196 passed,
+  0 regressões.
+
+### Open questions
+- `prod.bronze_source_mode: kafka` continua não verificado contra uma infraestrutura Kafka
+  de fato alcançável por `prod` — é um estado-alvo documentado, não uma configuração testada.
+  Deploy de `prod` antes dessa verificação precisaria sobrescrever para `volume` manualmente.
+
+### Status: resolved
+
+---
+
+## 2026-06-19 — pipelines/ubereats_pipeline.py — decorator de Bronze para source_mode=volume e ciclo quarantine↔silver no DAG do DLT
+
+### Implemented
+- `register_bronze()` — decorator agora escolhido por modo: `dp.materialized_view` quando
+  `SOURCE_MODE == "volume"` (`dev`/`free_edition`), `dp.table` quando `kafka` (`prod`). A
+  suposição original (DESIGN_PIPELINE_UNIFICATION.md Decision 2) de que `@dp.table` infere o
+  tipo de tabela a partir do corpo da função (streaming vs. estático) não se sustenta para o
+  validador real do Lakeflow — o caminho `spark.read` (batch) exige `@dp.materialized_view`
+  explícito.
+- `_unique_violations()` — removido o parâmetro `silver_table` e a leitura
+  `spark.read.table(silver_table)`. A checagem de unicidade agora compara apenas dentro do
+  próprio `candidate_df` (self-join via `groupBy(field).agg(countDistinct(merge_key))`),
+  eliminando a dependência quarantine → silver_table que formava um ciclo
+  `quarantine → silver_table → clean_view → quarantine` no DAG do DLT.
+- `docs/adr/007_pipeline_unification.md` — novo "Addendum 2 (2026-06-19)" documentando os
+  dois fixes e o trade-off aceito (uniqueness check não detecta mais duplicata entre runs
+  diferentes, só dentro do batch corrente — mitigado pelos guards `row_number()` já existentes
+  em `register_gold_driver_performance()`/`register_gold_revenue_per_restaurant()`).
+
+### Decisions made during build
+- O ciclo do DAG foi verificado em **dois** domínios, não só `restaurants`: `contracts/
+  drivers.yml` e `contracts/restaurants.yml` são os únicos dois contratos com regra
+  `check: unique` em `scope: [silver]` (confirmado via grep nos YAMLs) — `driver_id` e `cnpj`
+  respectivamente. Ambos tinham o mesmo ciclo; o fix em `_unique_violations()` corrige os dois
+  de uma vez, já que a função é compartilhada por todo o loop de `register_silver()`.
+- Mantido o padrão "Silver e Quarantine leem da mesma view upstream, nenhuma tabela lê de
+  outra do mesmo nível" — a única violação desse padrão no arquivo era a leitura estática de
+  `silver_table` dentro de `_unique_violations()`; nenhum outro domínio/tabela faz leitura
+  cross-level equivalente.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py` → sem erros de sintaxe.
+- `ruff check pipelines/ubereats_pipeline.py` → 11 findings, todos pré-existentes (`F821
+  Undefined name 'spark'` — `spark` é injetado em runtime pelo Lakeflow, não importado; mesma
+  contagem antes/depois do fix, exceto uma queda de 12→11 pela remoção do parâmetro
+  `silver_table` não utilizado fora do novo corpo da função).
+- `PYTHONPATH=. pytest tests/test_contracts.py tests/test_dlt_adapter.py -q` → 196 passed,
+  0 regressões.
+- Validação do DAG em si (ausência de ciclo) só é observável contra um workspace Lakeflow
+  real — não há teste unitário que reproduza a validação de grafo do DLT.
+
+### Open questions
+- Nenhuma — os dois fixes foram aplicados, verificados estaticamente, e o deploy/run fica
+  para a etapa seguinte deste build.
+
+### Status: resolved
+
+---
+
+## 2026-06-19 — register_bronze() / export_kafka_to_volume.py — erro timestampNtz no Delta
+
+### Implemented
+- `pipelines/ubereats_pipeline.py` — `register_bronze()` agora monta `timestamp_fields` a
+  partir de `contract["schema"]` (campos com `type: timestamp`) e, após construir o DataFrame
+  de Bronze (qualquer um dos dois branches), faz `.withColumn(field, col(field).cast("timestamp"))`
+  em cada um. Garante `TimestampType` na saída de Bronze independente de como a fonte upstream
+  codificou o campo.
+- `scripts/export_kafka_to_volume.py` — `_PYARROW_TYPE_MAP["timestamp"]` mudou de
+  `pa.timestamp("ms")` para `pa.timestamp("ms", tz="UTC")`, corrigindo a causa raiz no lado da
+  escrita (Parquet sem tz vinha com `isAdjustedToUTC=false`, que o Spark 3.4+ le como
+  `TimestampNTZType`).
+- `docs/adr/007_pipeline_unification.md` — novo "Addendum 3 (2026-06-19)" documentando os dois
+  pontos do bug (onde NÃO estava — `contracts/spark_schema.py` já mapeava corretamente, mas é
+  código morto, nunca chamado pelo pipeline — e onde estava de fato) e por que a opção de
+  `TBLPROPERTIES delta.feature.timestampNtz=supported` foi descartada (aceitaria um tipo
+  semanticamente diferente do que todo o resto do Bronze usa).
+
+### Decisions made during build
+- A investigação solicitada apontava para `contracts/spark_schema.py` como o lugar do bug,
+  mas essa função (`to_struct_type()`) já mapeia `timestamp` → `TimestampType` corretamente
+  e não é chamada em lugar nenhum do pipeline real — é código morto. A causa raiz estava em
+  `scripts/export_kafka_to_volume.py` (schema PyArrow sem timezone), exercitada porque `dev`
+  roda em `source_mode=volume` (ver Addendum 2026-06-19 do ADR-007).
+- Aplicado fix em duas camadas em vez de uma só: o cast explícito em `register_bronze()`
+  (não exige re-exportar/re-fazer upload do Volume já populado) e a correção do schema PyArrow
+  na fonte (para que futuras exportações não dependam do cast como crutch). Ambos resolvem o
+  mesmo bug por ângulos diferentes — escrita e leitura.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py scripts/export_kafka_to_volume.py` →
+  sem erros de sintaxe.
+- `ruff check` em ambos os arquivos → mesmos 11 findings pré-existentes (`F821 spark`), nenhum
+  novo.
+- `PYTHONPATH=. pytest tests/test_contracts.py tests/test_dlt_adapter.py -q` → 196 passed,
+  0 regressões.
+- Não verificado contra um write Delta real nesta sessão — a confirmação definitiva de que o
+  erro `timestampNtz` desaparece só vem do próximo `databricks bundle deploy -t dev` +
+  `bundle run`.
+
+### Open questions
+- Nenhuma quanto ao código. Pendente: re-rodar o pipeline em `dev` para confirmar que o erro
+  `timestampNtz` não recorre (e que o problema de ownership de tabelas MANAGED de runs
+  anteriores, reportado separadamente nesta sessão, não bloqueia de novo).
+
+### Status: resolved
+
+---
+
+## 2026-06-19 — register_silver() — dp.read_stream() em bronze_table não append-only (volume mode)
+
+### Implemented
+- Re-rodado `dev` após o fix do `timestampNtz`: o erro de timestamp não recorreu, e o
+  conflito de ownership de tabelas MANAGED (reportado antes) também não recorreu — ambos
+  ficam confirmados como resolvidos. Mas surgiu um terceiro erro, novo: todas as 10 tabelas
+  `quarantine.<domain>` dos domínios Silver genéricos falharam com "Streaming tables may only
+  use append-only streaming sources" / "non-append only streaming source".
+- Causa: `register_silver()`'s `_candidate()` chamava `dp.read_stream(bronze_table)`
+  incondicionalmente. Em `kafka` mode isso é correto (bronze é tabela streaming real). Em
+  `volume` mode, o fix anterior (Addendum 2 do ADR-007) tornou `bronze_table` um
+  `@dp.materialized_view()` — recompute completo a cada run, não append-only — e ler isso via
+  `dp.read_stream()` é exatamente o que o Structured Streaming proíbe. `_quarantine()` e
+  `_clean()` tinham o mesmo padrão um nível abaixo. `register_silver_users()` nunca foi afetado
+  porque já usava `dp.read()` (batch) em todo lugar.
+- `pipelines/ubereats_pipeline.py` — `register_silver()` agora define
+  `_read = dp.read_stream if SOURCE_MODE == "kafka" else dp.read` uma vez por domínio, e
+  `_candidate()`/`_quarantine()`/`_clean()` chamam `_read(...)` em vez de `dp.read_stream(...)`
+  hardcoded. `create_streaming_table`/`create_auto_cdc_flow` do `silver_table` ficaram
+  inalterados.
+- `docs/adr/007_pipeline_unification.md` — "Addendum 4 (2026-06-19)" documentando a causa e o
+  fix, e por que `create_auto_cdc_flow` não foi trocado por `create_auto_cdc_from_snapshot_flow`
+  preventivamente (docs da Databricks não declaram um requisito explícito de source streaming
+  para `create_auto_cdc_flow`; a verificação fica para o próximo run real em vez de uma segunda
+  mudança de arquitetura especulativa).
+
+### Decisions made during build
+- Pesquisei via WebSearch/WebFetch (docs.databricks.com) se `create_auto_cdc_flow` exige
+  source streaming antes de decidir trocar para `create_auto_cdc_from_snapshot_flow` — a
+  documentação não confirma nem nega isso explicitamente. Decidido não fazer a troca
+  especulativamente; deixar o próximo run real decidir se é necessário.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py` → sem erros de sintaxe.
+- `ruff check pipelines/ubereats_pipeline.py` → mesmos 11 findings pré-existentes (`F821
+  spark`), nenhum novo.
+- `PYTHONPATH=. pytest tests/test_contracts.py tests/test_dlt_adapter.py -q` → 196 passed,
+  0 regressões.
+- Não verificado contra um run real do Lakeflow nesta sessão ainda — pendente do próximo
+  `databricks bundle deploy -t dev` + `bundle run`.
+
+### Open questions
+- Se `create_auto_cdc_flow` rejeitar `clean_view` como source não-streaming em `volume` mode,
+  o próximo passo seria trocar para `create_auto_cdc_from_snapshot_flow` especificamente para
+  esse modo — não implementado preventivamente nesta entrada.
+
+### Status: in_progress — pendente confirmação via run real
+
+---
+
+## 2026-06-19 — register_silver() — create_auto_cdc_flow rejeita clean_view como view não-streaming (volume mode)
+
+### Implemented
+- Re-rodado `dev` após o fix anterior: as 10 tabelas `quarantine.<domain>` passaram, mas todas
+  as 10 tabelas `silver.<domain>` falharam com
+  `pyspark.errors.exceptions.captured.AnalysisException: View '<domain>_silver_clean' is not
+  a streaming view and must be referenced using read.` — confirma a pergunta aberta da entrada
+  anterior: `create_auto_cdc_flow` exige source streaming, e `clean_view` é batch em
+  `volume` mode (consequência do fix anterior).
+- `pipelines/ubereats_pipeline.py` — `register_silver()` agora ramifica por `SOURCE_MODE` na
+  chamada final: `kafka` mantém `create_auto_cdc_flow(..., sequence_by=col("__source_ts_ms"))`;
+  `volume` passa a usar `create_auto_cdc_from_snapshot_flow(target=silver_table,
+  source=clean_view, keys=[merge_key], stored_as_scd_type=1)` — a variante batch/snapshot
+  documentada da Databricks para esse caso exato (cada run = um snapshot completo, sem
+  `sequence_by` porque não há ordenação por linha a expressar).
+- `docs/adr/007_pipeline_unification.md` — "Addendum 5 (2026-06-19)" documentando o erro, o fix,
+  e por que a alternativa `pipelines.incompatibleViewCheck.enabled = false` (citada na própria
+  mensagem de erro) foi rejeitada — suprimiria o check em vez de corrigir o descompasso
+  semântico (snapshot completo tratado como stream incremental) que o check existe para apontar.
+
+### Decisions made during build
+- Pesquisado via WebFetch a assinatura completa de `create_auto_cdc_from_snapshot_flow` antes
+  de implementar — confirma que não tem `sequence_by` (o snapshot inteiro é a unidade de
+  recência) e que a forma simples (passar um nome de view/tabela batch como `source`) é
+  exatamente o caso de uso aqui, sem precisar da forma complexa (lambda com versionamento).
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py` → sem erros de sintaxe.
+- `ruff check pipelines/ubereats_pipeline.py` → mesmos 11 findings pré-existentes (`F821
+  spark`), nenhum novo.
+- `PYTHONPATH=. pytest tests/test_contracts.py tests/test_dlt_adapter.py -q` → 196 passed,
+  0 regressões.
+- Não verificado contra um run real do Lakeflow nesta sessão ainda — pendente do próximo
+  `databricks bundle deploy -t dev` + `bundle run`, terceira tentativa consecutiva nesta
+  sessão, cada uma destravando exatamente uma falha e revelando a próxima.
+
+### Open questions
+- Nenhuma quanto à escolha da API — `create_auto_cdc_from_snapshot_flow` é a variante
+  documentada para exatamente este caso. Pendente apenas confirmação via run real.
+
+### Status: in_progress — pendente confirmação via run real
+
+---
+
+## 2026-06-19 — register_silver() check:unique removido + register_bronze() volta a streaming table via Auto Loader
+
+### Implemented
+- Run em `dev` foi cancelado (job 255308898705286) ao falhar com
+  `[CANNOT_CHANGE_DATASET_TYPE] Cannot change the dataset type ... from STREAMING_TABLE to
+  MATERIALIZED_VIEW for ubereats_dev.quarantine.payments` — conflito de metadata do Unity
+  Catalog, não um bug de código novo. Cancelado via `databricks jobs cancel-run` em vez de
+  deixar exaurir retries (cada retry teria o mesmo resultado).
+- `pipelines/ubereats_pipeline.py` — `register_silver()`: removida toda a lógica de
+  `check: unique` em quarantine (`_unique_violations()`, `unique_fields`, `unique_bad`).
+  `_quarantine()` agora só aplica `row_predicate`. Causa: `COUNT(DISTINCT merge_key)` dentro de
+  `groupBy().agg()` não é suportado em streaming sem watermark — `_unique_violations()` rodaria
+  isso sobre um DataFrame de streaming real em `kafka` mode. Arquitetura correta: `check:
+  unique` é propriedade de merge-time do Silver, não um gate de quarantine pré-merge; os
+  guards `row_number()` em `register_gold_driver_performance()`/
+  `register_gold_revenue_per_restaurant()` continuam sendo a defesa real.
+- `contracts/dlt_adapter.py` — removida `unique_check_fields()` (sem mais nenhum chamador).
+  Docstring de `quarantine_row_level_predicate()` atualizada.
+- `tests/test_dlt_adapter.py` — removidos o import e os 3 testes de `unique_check_fields`
+  (196 → 193 testes).
+- `pipelines/ubereats_pipeline.py` — `register_bronze()`: revertido `@dp.materialized_view()`
+  (Addendum 2) para `@dp.table()` incondicional. `volume` mode passa a usar Auto Loader
+  (`spark.readStream.format("cloudFiles")` com `cloudFiles.format=parquet`) em vez de
+  `spark.read.format("parquet")` batch — Bronze fica streaming/append-only/imutável nos dois
+  modos, igual à convenção Medallion. Novo `CHECKPOINTS_BASE` aponta para o Volume
+  `checkpoints/bronze` (provisionado por `scripts/preflight_unity_catalog.sh`, documentado
+  como não-usado até agora) para `cloudFiles.schemaLocation`.
+- `docs/adr/007_pipeline_unification.md` — "Addendum 6 (2026-06-19)" documentando os dois
+  fixes, o trade-off aceito (unique não é mais detectado em quarantine, mitigado pelos guards
+  de Gold), o follow-up não corrigido (`export_kafka_to_volume.py` sobrescreve o mesmo
+  `data.parquet`, Auto Loader por padrão não reprocessa caminho já visto), e a consequência
+  prática: os 20 `bronze.*` (agora `MATERIALIZED_VIEW` → precisam ser `STREAMING_TABLE`) e os
+  10 `quarantine.<domain>` genéricos (ainda `STREAMING_TABLE` → precisam ser
+  `MATERIALIZED_VIEW`, Addendum 4) somam 30 tabelas que precisam de DROP antes do próximo run.
+
+### Decisions made during build
+- Verificado via `databricks tables get` contra o workspace real (não assumido) que: os 20
+  `bronze.*` estão `MATERIALIZED_VIEW`, os 10 `quarantine.<domain>` genéricos estão
+  `STREAMING_TABLE`, `silver.*` e `quarantine.users` já estão no tipo correto (sem conflito).
+- Não revertida a ramificação por `SOURCE_MODE` em `register_silver()` (Addendum 4/5) mesmo
+  com Bronze voltando a streaming — `dp.read()` (batch) contra uma streaming table é válido e
+  já usado em outro lugar do mesmo arquivo (Gold lendo Silver), e o pedido do usuário era
+  escopado só a `register_bronze()`.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py contracts/dlt_adapter.py
+  tests/test_dlt_adapter.py` → sem erros de sintaxe.
+- `ruff check` → 12 findings (mesmo baseline `F821 spark` + 1 novo para `CHECKPOINTS_BASE`,
+  mesma causa raiz).
+- `PYTHONPATH=. pytest tests/ -q` → 193 passed, 0 regressões.
+- Não verificado contra um run real ainda — pendente confirmação do usuário sobre o DROP das
+  30 tabelas antes do próximo `databricks bundle deploy -t dev` + `bundle run`.
+
+### Open questions
+- Confirmação do usuário pendente: dropar os 20 `bronze.*` + 10 `quarantine.<domain>` antes do
+  próximo run, ou alguma alternativa.
+
+### Status: resolved — usuário confirmou DROP das 30 tabelas, run subsequente passou de
+Bronze/Quarantine sem conflito de tipo (confirmado via `databricks tables get`), revelando a
+falha tratada na entrada seguinte.
+
+---
+
+## 2026-06-19 — register_silver() revertido para streaming uniforme — create_auto_cdc_from_snapshot_flow rejeita status_id duplicado
+
+### Implemented
+- Run em `dev` após o DROP das 30 tabelas passou de Bronze (recriado `STREAMING_TABLE`) e
+  Quarantine (recriado `MATERIALIZED_VIEW`) sem conflito — confirmado nos eventos do pipeline
+  (`INFO STREAMING_TABLE ... has been created` / `INFO Materialized View ... has been
+  created`). Falhou em Silver:
+  `[APPLY_CHANGES_FROM_SNAPSHOT_ERROR.DUPLICATE_KEY_VIOLATION] Found 468 rows for key
+  '{"status_id":"1"}' ... Expected at most 1 row per key.`
+- Verificado `contracts/order_status.yml`: `merge_key: status_id`, sem regra `unique` — é um
+  código de status (pending/confirmed/etc.), não um id único de linha, ao contrário do que a
+  tabela domain-map do CLAUDE.md sugere ao rotulá-lo "PK". `create_auto_cdc_from_snapshot_flow`
+  (Addendum 5) exige exatamente uma linha por key por snapshot e não tem `sequence_by` para
+  desempatar — isso nunca foi um problema com `create_auto_cdc_flow` (CDC tolera múltiplas
+  linhas por key dentro de um batch, escolhendo a mais recente via `sequence_by`).
+- `pipelines/ubereats_pipeline.py` — `register_silver()`: revertido por completo o Addendum
+  4/5. Agora que Bronze é streaming nos dois modos (Addendum 6), não há mais razão para
+  ramificar por `SOURCE_MODE` aqui. `_candidate()`/`_quarantine()`/`_clean()` voltam a
+  `dp.read_stream()` incondicional; a flow final volta a `create_auto_cdc_flow(...,
+  sequence_by=col("__source_ts_ms"), stored_as_scd_type=1)` incondicional — a forma original,
+  antes de todo o desvio Bronze/Silver de hoje, agora legitimamente restaurável.
+- `docs/adr/007_pipeline_unification.md` — "Addendum 7 (2026-06-19)" documentando a causa,
+  o revert completo, e a consequência prática (10 `quarantine.<domain>` precisam de DROP de
+  novo; `silver.*` julgado sem necessidade de DROP já que só a flow muda, não o tipo da
+  tabela — a ser confirmado pelo próximo run, não assumido).
+
+### Decisions made during build
+- Apresentadas 2 opções ao usuário: reverter Silver por completo para streaming uniforme
+  (recomendado) vs. manter `create_auto_cdc_from_snapshot_flow` e adicionar um dedup
+  `row_number()` antes dele. Usuário escolheu o revert completo.
+- Apresentada a questão de dropar `quarantine.*` apenas (necessário, confirmado) vs. dropar
+  `quarantine.*` + `silver.*` preventivamente (por causa do risco incerto de troca de tipo de
+  flow). Usuário escolheu dropar apenas `quarantine.*` e deixar o próximo run revelar se
+  `silver.*` também precisa.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py` → sem erros de sintaxe.
+- `ruff check pipelines/ubereats_pipeline.py` → mesmos 12 findings (baseline `F821 spark` +
+  `CHECKPOINTS_BASE`), nenhum novo.
+- `PYTHONPATH=. pytest tests/ -q` → 193 passed, 0 regressões.
+- Confirmado via `databricks tables get` que os 10 `quarantine.<domain>` estão
+  `MATERIALIZED_VIEW` (precisam voltar a `STREAMING_TABLE`) antes do próximo run.
+
+### Open questions
+- Se a troca de flow (`create_auto_cdc_from_snapshot_flow` → `create_auto_cdc_flow`) sobre o
+  mesmo `silver.*` `STREAMING_TABLE` já existente vai conflitar como os casos anteriores —
+  não dropado preventivamente; o próximo run decide.
+
+### Status: resolved — usuário confirmou dropar só `quarantine.<domain>`; run passou de
+Bronze/Quarantine de novo (sem conflito de tipo, e a troca de flow em Silver nem chegou a ser
+testada), revelando a falha tratada na entrada seguinte.
+
+---
+
+## 2026-06-19 — _clean() fazia LeftAnti join stream-stream — quarantine_table não deveria ser lido por mais nada
+
+### Implemented
+- Run em `dev` após o revert do Addendum anterior falhou identicamente nos 10 domínios Silver
+  genéricos: `LeftAnti joins with a streaming DataFrame/Dataset on the right are not
+  supported.` Cancelado o job em andamento (run 207907731626341) já que o erro recorreria em
+  todo retry.
+- Causa: `_clean()` fazia `candidate.join(dp.read_stream(quarantine_table), merge_key,
+  "left_anti")` — os dois lados streaming. Structured Streaming não suporta join
+  LeftAnti/LeftSemi stream-stream com fonte streaming do lado direito. Esse código já existia
+  ANTES desta sessão (não foi introduzido por nenhum fix de hoje) — só nunca rodou, porque toda
+  tentativa anterior hoje falhava antes de `_clean()` (conflitos de ownership UC,
+  `timestampNtz`, conflitos de tipo de dataset, o erro de duplicate-key do snapshot-flow).
+- `pipelines/ubereats_pipeline.py` — `register_silver()`: `_clean()` não lê mais
+  `quarantine_table`. Aplica o complemento booleano de `row_predicate` direto em
+  `candidate_view` (`candidate.filter(f"NOT ({row_predicate})")`), em vez de recomputar via
+  anti-join contra a tabela já materializada. Isso finalmente realiza por completo o padrão
+  pedido no início desta sessão (Silver e Quarantine leem da MESMA view upstream; Quarantine
+  usa o predicado; Clean usa o complemento; nenhuma tabela lê outra do mesmo nível) —
+  `quarantine_table` agora é escrita mas não lida por mais nada no pipeline.
+- `docs/adr/007_pipeline_unification.md` — "Addendum 8 (2026-06-19)" documentando a causa, o
+  fix, e que não há mudança de tipo de dataset envolvida (`_clean()` é view temporária, não
+  tabela persistida) — sem necessidade de DROP antes do próximo run.
+
+### Verification
+- `python3 -m py_compile pipelines/ubereats_pipeline.py` → sem erros de sintaxe.
+- `ruff check pipelines/ubereats_pipeline.py` → mesmos 12 findings, nenhum novo.
+- `PYTHONPATH=. pytest tests/ -q` → 193 passed, 0 regressões.
+
+### Open questions
+- Se a troca de flow do Addendum 7 (`create_auto_cdc_from_snapshot_flow` →
+  `create_auto_cdc_flow`) sobre o `silver.*` `STREAMING_TABLE` existente vai funcionar sem
+  conflito — ainda não testado, pendente do próximo run.
+
+### Status: resolved — run em `dev` (run_id 584817317820436) terminou `TERMINATED SUCCESS` em
+~1m35s. Confirmado via `databricks tables get` que as 6 tabelas Gold existem
+(`payments_by_status`, `payment_funnel`, `payment_lifecycle`, `driver_performance`,
+`revenue_per_restaurant`, `user_behavior`) — nenhuma delas tinha sido criada em nenhum run
+anterior nesta sessão. Primeiro run end-to-end limpo das 37 tabelas (20 Bronze + 11 Silver +
+11 Quarantine + 6 Gold) depois de 8 addenda consecutivos no ADR-007, cada um destravando
+exatamente a próxima falha na cadeia: decorator (2) → ciclo DAG (2) → timestampNtz (3) →
+streaming source não-append-only (4) → snapshot-flow exige source streaming (5) → agregação
+streaming sem watermark (6) → Bronze revertido para Auto Loader (6) → snapshot-flow exige
+unicidade de key (7) → LeftAnti join stream-stream (8). A troca de flow do Addendum 7 não
+precisou de DROP — confirmado que foi mesmo só redefinição de flow, não mudança de tipo de
+dataset, como previsto.
