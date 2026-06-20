@@ -19,6 +19,11 @@ yamllint = "^1.35"
 bandit = "^1.8"
 pre-commit = "^4.0"
 
+[tool.pytest.ini_options]
+# Bare `pytest` (unlike `python -m pytest`) doesn't add the repo root to
+# sys.path, so `from contracts...` imports fail in CI's `pytest tests/ -v`.
+pythonpath = ["."]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100
