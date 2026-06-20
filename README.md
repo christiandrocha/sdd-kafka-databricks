@@ -256,7 +256,9 @@ make deploy-prod             # databricks bundle deploy --target prod
 
 ```bash
 make lint                    # ruff + yamllint
-make test                    # pytest tests/test_contracts.py
+make test                    # pytest tests/ (contracts + dlt_adapter)
+make security                # bandit -r contracts/ pipelines/ tests/ scripts/
+make precommit-install       # pre-commit install — runs ruff/bandit/file checks before every commit
 ```
 
 ---

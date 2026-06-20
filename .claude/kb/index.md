@@ -12,6 +12,8 @@
 | medallion | medallion.md | Bronze/Silver/Gold patterns, contract-driven registration, quarantine, Gold full-recompute |
 | data-quality | data-quality.md | Data Contracts YAML, quality rules, dlt_adapter translation, check:unique enforcement gap |
 | governance | governance.md | PII/LGPD fields (cpf, cnpj, email, license_number), Unity Catalog masking/row filters — design reference, not yet implemented |
+| anti-patterns | anti-patterns.md | Centralized anti-patterns with severity (CRITICAL/HIGH/MEDIUM), mapped to what's actually fixed vs. an open gap in this project |
+| checklists | checklists.md | Definition of Done before declaring a contract/pipeline change complete |
 | schema-registry | schema-registry.md | Avro, Confluent, BACKWARD compatibility |
 | cicd | cicd.md | GitHub Actions, DABs deploy, lint, bundle validate |
 | observability | observability.md | Prometheus, Grafana, Kafka consumer lag, alert rules |
