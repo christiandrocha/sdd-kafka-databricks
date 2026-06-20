@@ -55,8 +55,14 @@ generic Silver domains' `merge_key` upsert; Gold/`silver_users` are full
 batch-recompute `@dp.table` materialized views instead (no MERGE — a full
 recompute is already what their old `MERGE INTO ... WHEN MATCHED UPDATE SET *`
 amounted to, since each run re-aggregates over the complete Silver table).
-`check: unique` (see below) is a stream-static join inside the quarantine
-table's function body, since `@dp.expect` can't express cross-row checks. This
+`check: unique` (see below) is declared in the contract but excluded from
+`contracts/dlt_adapter.py`'s quarantine predicate for the 10 generic Silver
+domains — Structured Streaming can't express the needed cross-row aggregation
+without a watermark. `register_silver_users()`'s hand-written `user_id`
+duplicate check is the one place this kind of rule is actually enforced (a
+batch `groupBy().count()` over `dp.read()`, not a stream), since `users` reads
+Bronze in batch, not as a stream. See "Gold dimension joins" below and
+`.claude/kb/data-quality.md` for the full mechanics. This
 supersedes `ADR-006`'s "Explicitly NOT migrated" section (Gold, `silver_users`,
 `free_edition`) — none of those exclusion reasons survived once Gold's logic
 ported cleanly into `@dp.table` bodies and `free_edition` turned out to share
@@ -107,19 +113,32 @@ table's `merge_key` (`gold_user_behavior` → `silver.users.user_id`, real key
 `uuid`; `gold_revenue_per_restaurant` → `silver.restaurants.cnpj`, real key
 `uuid`). Nothing guaranteed those columns were unique, which already caused a
 `DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE` failure once
-(`gold_user_behavior`). Fixed with two layers, not one: (1) a new contract
-quality-rule type, `check: unique`, enforced in Silver via anti-join against
-the existing table (`contracts/drivers.yml`/`contracts/restaurants.yml`,
-translated by `contracts/dlt_adapter.py` for `pipelines/ubereats_pipeline.py`,
-which now runs identically across all 3 targets;
-`register_silver_users()` has the equivalent by hand for `user_id` since
-`users` has no YAML contract) —
-violations are quarantined, not silently dropped or resolved; (2) a
-`row_number()` guard kept right before every affected Gold `MERGE`, as
-defense-in-depth for rows that landed before the rule existed. `merge_key`
-itself is never changed — it stays the real CDC identity (`uuid`/`cpf`), not
-the column Gold happens to join on. See
-`docs/adr/005_gold_dimension_join_integrity.md`.
+(`gold_user_behavior`). Two layers were designed, but only one actually
+enforces today: (1) a contract quality-rule type, `check: unique`
+(`contracts/drivers.yml`/`contracts/restaurants.yml`), declared and
+structurally validated (`tests/test_contracts.py::test_09`) but **not enforced
+at runtime** for these two — `contracts/dlt_adapter.py`'s
+`quarantine_row_level_predicate()` explicitly excludes `check: unique` from the
+row-level SQL it generates, because Structured Streaming rejects the cross-row
+`COUNT(DISTINCT ...)` this would need, without a watermark, in `kafka` mode.
+The one place uniqueness *is* actually enforced is `register_silver_users()`'s
+hand-written `user_id` duplicate check — it can run a real
+`groupBy("user_id").count()` because `users` reads Bronze in batch
+(`dp.read()`, not `dp.read_stream()`), and duplicates are genuinely quarantined
+with `_quarantine_reason="duplicate_user_id"`. (2) The `row_number()` guard
+kept right before every affected Gold table's return statement is therefore
+the **primary** protection for `driver_performance`/`revenue_per_restaurant`/
+`user_behavior` against `driver_id`/`cnpj`/`user_id` duplicates — not
+defense-in-depth backstopping a runtime quarantine check, since that check
+never runs for the streaming-based generic Silver domains. `merge_key` itself
+is never changed — it stays the real CDC identity (`uuid`/`cpf`), not the
+column Gold happens to join on. See
+`docs/adr/005_gold_dimension_join_integrity.md` and
+`.claude/kb/data-quality.md`. Flagged for `/design` review: closing this gap
+means either enforcing `check: unique` via a periodic batch reconciliation job
+(the streaming path can't do it inline) or formally accepting the
+`row_number()` guard as the permanent, sole mechanism and updating the ADR
+accordingly.
 
 ## Unity Catalog structure
 

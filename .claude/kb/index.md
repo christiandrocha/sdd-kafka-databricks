@@ -8,9 +8,10 @@
 |---|---|---|
 | kafka-cdc | kafka-cdc.md | Debezium, WAL, SMT, connectors, 20-table CDC |
 | databricks | databricks.md | Structured Streaming, MERGE INTO, DABs, Unity Catalog |
-| spark | spark.md | PySpark patterns, Delta Lake, from_avro, Liquid Clustering |
-| medallion | medallion.md | Bronze/Silver/Gold patterns, quality gates, quarantine |
-| data-quality | data-quality.md | Data Contracts YAML, quality rules, test_contracts |
+| spark | spark.md | **Referenced but missing — gap pre-dates this update, not yet written** |
+| medallion | medallion.md | Bronze/Silver/Gold patterns, contract-driven registration, quarantine, Gold full-recompute |
+| data-quality | data-quality.md | Data Contracts YAML, quality rules, dlt_adapter translation, check:unique enforcement gap |
+| governance | governance.md | PII/LGPD fields (cpf, cnpj, email, license_number), Unity Catalog masking/row filters — design reference, not yet implemented |
 | schema-registry | schema-registry.md | Avro, Confluent, BACKWARD compatibility |
 | cicd | cicd.md | GitHub Actions, DABs deploy, lint, bundle validate |
 | observability | observability.md | Prometheus, Grafana, Kafka consumer lag, alert rules |
@@ -28,3 +29,5 @@ CLAUDE.md has the domain map, ADR summaries, and critical architecture decisions
 - **Schema Registry**: Confluent (not Apicurio)
 - **Topology**: Unidirectional (load_to_postgres.py → PostgreSQL → Debezium → Kafka → Databricks)
 - **Unity Catalog**: ubereats_dev/prod → bronze/silver/gold/quarantine
+- **check: unique** is declarative/structural only today — not enforced at runtime in the Bronze→Silver quarantine gate (see data-quality.md). Don't assume CLAUDE.md's "anti-join" description matches current code.
+- **PII**: cpf/cnpj/email/license_number flow unmasked through Bronze→Silver→Gold (see governance.md). No masking/RLS implemented — reference only.
