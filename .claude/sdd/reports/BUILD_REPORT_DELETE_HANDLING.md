@@ -11,7 +11,7 @@
 | **Author** | build-agent (Claude) |
 | **DEFINE** | [DEFINE_DELETE_HANDLING.md](../features/DEFINE_DELETE_HANDLING.md) |
 | **DESIGN** | [DESIGN_DELETE_HANDLING.md](../features/DESIGN_DELETE_HANDLING.md) |
-| **Status** | Code + Postgres/Debezium-side verification: Complete. Databricks/Lakeflow-side (`apply_as_deletes` runtime behavior, `full_refresh` requirement): **implemented, not verified — no Databricks workspace available in this session.** |
+| **Status** | Code + Postgres/Debezium-side verification: Complete. Databricks/Lakeflow-side (`apply_as_deletes` runtime behavior, `full_refresh` requirement): **Verified 2026-06-22 against a real Databricks workspace (`dev`, profile `DEFAULT`) — see "Live Lakeflow Verification" below and AT-001/AT-004/AT-005.** |
 
 ---
 
@@ -105,6 +105,77 @@ This conclusively verifies the **input** to `register_silver()`'s `apply_as_dele
 logic is now correct. It does **not** verify what Lakeflow actually does with that
 input — that requires a real Databricks pipeline run.
 
+### Live Lakeflow Verification (Databricks `dev` workspace, 2026-06-22)
+
+A real Databricks workspace became available in this session (`~/.databrickscfg`
+profile `DEFAULT`, host `dbc-f3701868-1581.cloud.databricks.com`). This closes the gap
+the section above left open.
+
+1. `databricks bundle deploy --target dev` + `databricks bundle run jobs.ubereats_pipeline
+   --target dev` — pipeline ran `TERMINATED SUCCESS` in ~2.5 min, all 37 tables created.
+2. First run used `source_mode=volume` reading `/Volumes/ubereats_dev/landing/kafka_export/`
+   via Auto Loader (`cloudFiles`). Discovered: Auto Loader tracks files by path, so
+   overwriting `data.parquet` in place (via `databricks fs cp --overwrite`) was **not**
+   picked up — bronze tables for domains whose file already existed before this session
+   (e.g. `restaurants`, `drivers`, `ratings`, `inventory`, all empty-snapshot placeholders
+   from before they had Postgres rows) stayed at their stale row count. This is a real
+   operational gotcha for `source_mode=volume`, not a code bug — noted for `/design` review
+   on whether `export_kafka_to_volume.py` should write uniquely-named/timestamped files
+   instead of a fixed `data.parquet` per domain.
+3. Triggered `databricks pipelines start-update <id> --full-refresh` — this is exactly the
+   "does `apply_as_deletes` need `full_refresh=true` to reprocess already-ingested Bronze
+   history correctly" question DESIGN left open (no Databricks docs confirmation either
+   way). **Answer: yes, and it works correctly** — see AT-001/AT-004/AT-005 below.
+4. Post-full-refresh, `bronze.payments` contains both the INSERT (`__op='c'`) and DELETE
+   (`__op='d'`) events for the AT-001 test row (`payment_id=55555555-...`), each carrying
+   identical real field values — confirming the SMT/`REPLICA IDENTITY FULL` fix survived
+   the trip through Kafka → Auto Loader → Bronze. `silver.payments` has **zero** rows for
+   that `payment_id` — `apply_as_deletes` removed it, it did not survive as a NULL-corrupted
+   row (the original C08 bug) and it was not left present (an `apply_as_deletes` no-op bug).
+5. `silver.orders` converges to exactly 405 (matching live Postgres) despite `bronze.orders`
+   holding 810 raw events (a pre-existing 2x duplication from an earlier re-snapshot,
+   unrelated to this fix) — `create_auto_cdc_flow`'s `merge_key` dedup handles duplicate
+   history correctly, i.e. the fix didn't regress ordinary updates (AT-004).
+6. `gold.payments_by_status` sums to 260 (matching live Postgres, not 261) — the deleted
+   row does not leak into Gold aggregates, with zero Gold table code changes (AT-005).
+
+AT-002 (non-key quarantine domain delete) and AT-003 (`users` single-source delete) remain
+unexecuted — no test delete was performed against `drivers` or `users_mongo`/`users_mssql`
+in this run. The reasoning in DESIGN still stands as the only evidence for those two.
+
+### CI Status (GitHub Actions)
+
+Added 2026-06-20, after this report was first written: this build's commit
+(`37f08b5`) merged into `master` via PR #1, which surfaced that CI had been
+failing on **every single run since the repo's first commit** — unrelated to
+this feature's own code, but discovered while shipping it. Root causes (both
+pre-existing, neither introduced by this build):
+
+1. `pytest tests/ -v` (CI's literal command) doesn't add the repo root to
+   `sys.path` the way `python -m pytest` (what was used for every local
+   verification in this report) does — `from contracts...` imports failed
+   with `ModuleNotFoundError`. Fixed via `pythonpath = ["."]` under
+   `[tool.pytest.ini_options]` in `pyproject.toml` (PR #2).
+2. `yamllint contracts/` rejected the contracts' deliberate column-aligned
+   flow style against yamllint's strict defaults. Fixed via a new
+   `.yamllint.yml` relaxing only the 4 conflicting rules (PR #2).
+3. `bundle-validate` had no `DATABRICKS_HOST`/`DATABRICKS_TOKEN` repo secrets
+   configured at all. Fixed by creating `DATABRICKS_KAFKA_HOST`/
+   `DATABRICKS_KAFKA_TOKEN` secrets + repointing `ci.yml`'s `secrets.*`
+   references to match (PR #3).
+
+**Current status: all 4 CI jobs green on both `main` and `master`**
+(`env-guard`, `lint`, `test`, `bundle-validate` — verified via
+`gh run view` after each PR merge).
+
+**This does not change this report's Blockers or Final Status below.**
+`bundle-validate` is `databricks bundle validate` — static config validation
+against the DABs schema, not a pipeline run. It confirms `databricks.yml`
+parses and resolves correctly for the `dev`/`free_edition` targets; it does
+not execute `pipelines/ubereats_pipeline.py`, so it says nothing about
+`apply_as_deletes` runtime behavior. The Databricks/Lakeflow-side
+verification gap is unchanged.
+
 ### What Was NOT Verified (and why)
 
 | Item | Why not verified | What's needed |
@@ -140,11 +211,11 @@ input — that requires a real Databricks pipeline run.
 
 | ID | Scenario | Status | Evidence |
 |----|----------|--------|----------|
-| AT-001 | Delete on a generic Silver domain removes the row | ⏳ Pending | Input verified correct (live Kafka message has real values); Lakeflow-side removal not tested — no workspace |
-| AT-002 | Delete on a domain with a non-key quarantine rule still reaches `apply_as_deletes` | ⏳ Pending (reasoned, not executed) | `REPLICA IDENTITY FULL` means the field that rule checks (e.g. `driver_id` for `drivers`) is no longer `NULL` on delete, so it should pass quarantine like any normal row — confirmed by the new `test_quarantine_predicate_never_references_op_or_deleted` test that the predicate itself has no `__op`-blind-spot, but not run against a live delete event for this specific domain |
-| AT-003 | Delete on `users` (single source) removes the `cpf` | ⏳ Pending | Code changed per Pattern 2; no automated test (see Deviations); not run against live Databricks |
-| AT-004 | Updates still work (no regression) | ⏳ Pending | Code-reviewed: `apply_as_deletes` only changes behavior for `__op='d'` rows; not executed |
-| AT-005 | Gold reflects deletion with no Gold code change | ⏳ Pending | Depends on AT-001; not independently testable without it |
+| AT-001 | Delete on a generic Silver domain removes the row | ✅ Verified 2026-06-22 | Real Databricks workspace (`dev`), full pipeline run + `full_refresh=true`: `bronze.payments` shows both the INSERT (`__op='c'`) and DELETE (`__op='d'`) events for `payment_id=55555555-5555-5555-5555-555555555555` with identical real field values (`method=pix, status=completed, amount=200.0, currency=BRL, country=BR`); `SELECT count(*) FROM ubereats_dev.silver.payments WHERE payment_id LIKE '5555%'` returns `0` — the row is removed, not NULL-corrupted |
+| AT-002 | Delete on a domain with a non-key quarantine rule still reaches `apply_as_deletes` | ⏳ Pending (reasoned, not executed) | `REPLICA IDENTITY FULL` means the field that rule checks (e.g. `driver_id` for `drivers`) is no longer `NULL` on delete, so it should pass quarantine like any normal row — confirmed by the new `test_quarantine_predicate_never_references_op_or_deleted` test that the predicate itself has no `__op`-blind-spot, but not run against a live delete event for this specific domain (no test delete was performed on `drivers` in the 2026-06-22 dev run) |
+| AT-003 | Delete on `users` (single source) removes the `cpf` | ⏳ Pending | Code changed per Pattern 2; no automated test (see Deviations); not run against a live delete event on `users_mongo`/`users_mssql` in the 2026-06-22 dev run |
+| AT-004 | Updates still work (no regression) | ✅ Verified 2026-06-22 | Same dev run: `bronze.orders` holds 810 raw CDC events (the table was re-snapshotted once mid-project, doubling its history) but `silver.orders` converges to exactly 405 — matching live Postgres — via `create_auto_cdc_flow`'s `merge_key` dedup, confirming non-delete updates still merge correctly post-fix |
+| AT-005 | Gold reflects deletion with no Gold code change | ✅ Verified 2026-06-22 | `SELECT sum(payment_count) FROM ubereats_dev.gold.payments_by_status` returns `260`, matching live Postgres `payments` row count exactly (not 261) — the deleted row does not leak into Gold aggregates, with zero changes to Gold table code |
 | Regression | All existing tests still pass | ✅ Pass | 213/213, including the 20 pre-existing parametrized contract/adapter tests |
 
 ---

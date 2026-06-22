@@ -56,6 +56,10 @@ def _cast_record(record: dict, contract_schema: list[dict]) -> dict:
     TIMESTAMPTZ -> io.debezium.time.ZonedTimestamp, an ISO-8601 string;
     TIMESTAMP (no tz) under time.precision.mode=connect -> epoch-millis long.
     The contract is the source of truth for the target type either way.
+
+    Postgres TIME columns decode via Avro's time-millis logical type into a
+    native datetime.time — contracts declare these as `string`, so render
+    back to ISO text rather than leaving an object pyarrow can't write.
     """
     known_fields = {f["name"] for f in contract_schema} - _BRONZE_ONLY_FIELDS
     casted = {k: v for k, v in record.items() if k in known_fields}
@@ -71,6 +75,8 @@ def _cast_record(record: dict, contract_schema: list[dict]) -> dict:
                 casted[name] = datetime.fromtimestamp(value / 1000, tz=UTC)
             elif isinstance(value, str):
                 casted[name] = datetime.fromisoformat(value)
+        elif field["type"] == "string" and not isinstance(value, str):
+            casted[name] = value.isoformat()
     return casted
 
 
@@ -121,7 +127,11 @@ def export_topic(domain: str, contract_path: Path, args: argparse.Namespace) -> 
         empty_polls = 0
         if msg.error():
             continue
-        records.append(_cast_record(msg.value(), contract["schema"]))
+        value = msg.value()
+        if value is None:
+            # Debezium tombstone following a delete (drop.tombstones=false) — no row to export.
+            continue
+        records.append(_cast_record(value, contract["schema"]))
 
     consumer.close()
 
