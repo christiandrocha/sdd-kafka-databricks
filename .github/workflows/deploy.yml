@@ -3,7 +3,7 @@ name: Deploy
 on:
   workflow_run:
     workflows: ["CI"]
-    branches: [main]
+    branches: [master]
     types: [completed]
 
 concurrency:
@@ -23,5 +23,5 @@ jobs:
       - name: databricks bundle deploy prod
         run: databricks bundle deploy --target prod
         env:
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_KAFKA_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_KAFKA_TOKEN }}
