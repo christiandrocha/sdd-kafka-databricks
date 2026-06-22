@@ -39,7 +39,7 @@ Debezium envelope — there is no unwrap step in Silver. Topology is
 unidirectional (JSON exports → Postgres → Debezium → Kafka), so the
 audit-trail argument for skipping the SMT does not apply here. See ADR-02.
 
-**DELETE handling — fix implemented 2026-06-20, Postgres side verified live, Databricks side pending dev verification**
+**DELETE handling — fix implemented 2026-06-20, verified live end-to-end (Postgres + Databricks) 2026-06-22**
 Originally a confirmed NULL-corruption gap (C08): no table set `REPLICA
 IDENTITY FULL`, so Postgres only logged primary-key columns in the
 before-image of an `UPDATE`/`DELETE`, and `register_silver()` had no
@@ -59,13 +59,27 @@ removes the target Silver row instead of upserting it. (3)
 delete rows through the dedup window and exclude a `cpf_key` from
 `silver.users` only if its *latest* event is a delete — previously the delete
 row was dropped before dedup, so the user's last live state persisted forever
-instead of being removed. **Not yet verified:** whether `apply_as_deletes`
-needs a `full_refresh=true` run to correctly reprocess already-ingested Bronze
-history — Databricks' public docs don't confirm this either way (checked
-during DESIGN); requires a real Databricks workspace to test, unavailable in
-this session. Treat the Lakeflow-side behavior as implemented-but-unverified
-until that dev test happens. See `.claude/kb/anti-patterns.md` (C08) and
-`.claude/sdd/features/BUILD_REPORT_DELETE_HANDLING.md` for the full trace.
+instead of being removed. **Verified live 2026-06-22** against the real `dev`
+Databricks workspace: yes, `apply_as_deletes` needs `full_refresh=true` to
+correctly reprocess already-ingested Bronze history (Databricks' public docs
+never confirmed this either way) — after deploying the bundle, running the
+pipeline once, then triggering `databricks pipelines start-update --full-refresh`,
+`silver.payments` correctly shows 0 rows for the AT-001 test `payment_id`
+(`bronze.payments` retains both its INSERT and DELETE events, each with full
+real field values) and `gold.payments_by_status` sums to exactly the live
+Postgres row count — confirming the delete propagates to Silver and Gold with
+no NULL-corruption and no leaked row. `silver.orders` also converges to the
+correct deduped count despite `bronze.orders` holding 2x raw events from an
+unrelated historical re-snapshot, confirming ordinary updates still merge
+correctly post-fix. AT-002 (non-key quarantine domain) and AT-003 (`users`
+single-source delete) remain unexecuted — no test delete was performed against
+`drivers` or `users_mongo`/`users_mssql` in this run. Separately, this run
+surfaced that `source_mode=volume`'s Auto Loader tracks ingested files by path,
+so re-running `scripts/export_kafka_to_volume.py` + `databricks fs cp --overwrite`
+on the *same* `data.parquet` path is silently ignored on incremental runs —
+only a `full_refresh` (or a uniquely-named file per export) picks up the new
+content; flagged for `/design` review. See `.claude/kb/anti-patterns.md` (C08) and
+`.claude/sdd/reports/BUILD_REPORT_DELETE_HANDLING.md` for the full trace.
 
 **One Lakeflow pipeline for everything, all 3 targets (v1.2.0)**
 `pipelines/ubereats_pipeline.py` (renamed from `bronze_silver_dlt.py`) loops
